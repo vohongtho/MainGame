@@ -5,6 +5,10 @@ on:
     branches: [ master ]
   workflow_dispatch:
 
+concurrency:
+  group: tree-navigator-production
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
