@@ -9,10 +9,8 @@ import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.location.Location
-import android.os.Build
 import android.os.Bundle
 import android.os.Looper
-import android.view.Surface
 import android.view.View
 import android.widget.Button
 import android.widget.TextView
@@ -36,8 +34,19 @@ import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
+import kotlin.math.sqrt
 
 class MainActivity : ComponentActivity(), SensorEventListener {
+
+    private data class Vec3(val x: Double, val y: Double, val z: Double) {
+        fun dot(o: Vec3) = x * o.x + y * o.y + z * o.z
+        fun normalized(): Vec3 {
+            val n = sqrt(x*x + y*y + z*z).coerceAtLeast(1e-9)
+            return Vec3(x/n, y/n, z/n)
+        }
+    }
+
+    private data class CameraBasis(val right: Vec3, val up: Vec3, val forward: Vec3, val heading: Double)
 
     private lateinit var previewView: PreviewView
     private lateinit var overlay: TreeOverlayView
@@ -66,20 +75,23 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var bearingUncertaintyDeg = 180.0
     private var targetAreaMode = false
 
-    private var magneticHeading: Double? = null
+    private var gameBasisRaw: CameraBasis? = null
+    private var absoluteHeading: Double? = null
     private var trueHeading: Double? = null
-    private var gameYaw: Double? = null
-    private var fusedHeading: Double? = null
-    private var absoluteOffset: Double? = null
+    private var headingOffset: Double? = null
     private var headingAccuracy = SensorManager.SENSOR_STATUS_UNRELIABLE
     private var turnSpeedDegPerSec = 0.0
-    private var lastGameYaw: Double? = null
+    private var lastGameHeading: Double? = null
     private var lastGameTimestampNs = 0L
 
     private var rawBearing: Double? = null
     private var filteredBearing: Double? = null
     private var distanceToTreeMeters: Float? = null
-    private var displayDelta: Double? = null
+    private var displayHorizontalDeg: Double? = null
+    private var displayVerticalDeg: Double? = null
+    private var latestHorizontalDeg: Double? = null
+    private var latestVerticalDeg: Double? = null
+    private var targetBehind = false
 
     private var debugVisible = false
     private var autoTreeCreated = false
@@ -128,14 +140,15 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             treeLng = null
             rawBearing = null
             filteredBearing = null
-            displayDelta = null
+            displayHorizontalDeg = null
+            displayVerticalDeg = null
             targetAreaMode = false
             maybeCreateTestTree(force = true)
         }
         btnDebug.setOnClickListener {
             debugVisible = !debugVisible
             tvDebug.visibility = if (debugVisible) View.VISIBLE else View.GONE
-            btnDebug.text = if (debugVisible) "Hide details" else "Details"
+            btnDebug.text = if (debugVisible) "Close" else "Details"
             renderState()
         }
     }
@@ -153,9 +166,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private fun startCamera() {
         if (!hasPermission(Manifest.permission.CAMERA)) return
-        val providerFuture = ProcessCameraProvider.getInstance(this)
-        providerFuture.addListener({
-            val provider = providerFuture.get()
+        val future = ProcessCameraProvider.getInstance(this)
+        future.addListener({
+            val provider = future.get()
             val preview = Preview.Builder().build().also { it.surfaceProvider = previewView.surfaceProvider }
             provider.unbindAll()
             provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview)
@@ -191,12 +204,12 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     }
 
     override fun onSensorChanged(event: SensorEvent) {
-        val yaw = extractYaw(event) ?: return
         when (event.sensor.type) {
-            Sensor.TYPE_GAME_ROTATION_VECTOR -> onGameYaw(yaw, event.timestamp)
-            Sensor.TYPE_ROTATION_VECTOR -> onAbsoluteYaw(yaw)
+            Sensor.TYPE_GAME_ROTATION_VECTOR -> onGameRotation(event)
+            Sensor.TYPE_ROTATION_VECTOR -> onAbsoluteRotation(event)
         }
         maybeCreateTestTree()
+        updateProjection()
         renderState()
     }
 
@@ -207,75 +220,70 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
     }
 
-    private fun extractYaw(event: SensorEvent): Double? {
-        if (event.sensor.type != Sensor.TYPE_GAME_ROTATION_VECTOR && event.sensor.type != Sensor.TYPE_ROTATION_VECTOR) return null
-        val rotation = FloatArray(9)
-        val remapped = FloatArray(9)
-        val orientation = FloatArray(3)
-        SensorManager.getRotationMatrixFromVector(rotation, event.values)
-        when (display?.rotation ?: Surface.ROTATION_0) {
-            Surface.ROTATION_0 -> SensorManager.remapCoordinateSystem(rotation, SensorManager.AXIS_X, SensorManager.AXIS_Y, remapped)
-            Surface.ROTATION_90 -> SensorManager.remapCoordinateSystem(rotation, SensorManager.AXIS_Y, SensorManager.AXIS_MINUS_X, remapped)
-            Surface.ROTATION_180 -> SensorManager.remapCoordinateSystem(rotation, SensorManager.AXIS_MINUS_X, SensorManager.AXIS_MINUS_Y, remapped)
-            Surface.ROTATION_270 -> SensorManager.remapCoordinateSystem(rotation, SensorManager.AXIS_MINUS_Y, SensorManager.AXIS_X, remapped)
-        }
-        SensorManager.getOrientation(remapped, orientation)
-        return BearingMath.normalizeDegrees(Math.toDegrees(orientation[0].toDouble()))
+    private fun cameraBasisFromRotationVector(values: FloatArray): CameraBasis {
+        val r = FloatArray(9)
+        SensorManager.getRotationMatrixFromVector(r, values)
+        val right = Vec3(r[0].toDouble(), r[3].toDouble(), r[6].toDouble()).normalized()
+        val up = Vec3(r[1].toDouble(), r[4].toDouble(), r[7].toDouble()).normalized()
+        val forward = Vec3(-r[2].toDouble(), -r[5].toDouble(), -r[8].toDouble()).normalized()
+        val heading = BearingMath.normalizeDegrees(Math.toDegrees(atan2(forward.x, forward.y)))
+        return CameraBasis(right, up, forward, heading)
     }
 
-    private fun onGameYaw(yaw: Double, timestampNs: Long) {
-        gameYaw = yaw
-        lastGameYaw?.let { previous ->
-            val dt = (timestampNs - lastGameTimestampNs) / 1_000_000_000.0
+    private fun onGameRotation(event: SensorEvent) {
+        val basis = cameraBasisFromRotationVector(event.values)
+        gameBasisRaw = basis
+        lastGameHeading?.let { previous ->
+            val dt = (event.timestamp - lastGameTimestampNs) / 1_000_000_000.0
             if (dt > 0.001) {
-                val instant = abs(BearingMath.angleDifference(yaw, previous)) / dt
-                turnSpeedDegPerSec = turnSpeedDegPerSec * 0.78 + min(instant, 360.0) * 0.22
+                val instant = abs(BearingMath.angleDifference(basis.heading, previous)) / dt
+                turnSpeedDegPerSec = turnSpeedDegPerSec * 0.80 + min(instant, 360.0) * 0.20
             }
         }
-        lastGameYaw = yaw
-        lastGameTimestampNs = timestampNs
-
-        absoluteOffset?.let { offset ->
-            val target = BearingMath.normalizeDegrees(yaw + offset)
-            val previous = fusedHeading
-            fusedHeading = if (previous == null) target else {
-                val error = BearingMath.angleDifference(target, previous)
-                val alpha = when {
-                    turnSpeedDegPerSec < 2.0 -> 0.08
-                    turnSpeedDegPerSec < 12.0 -> 0.20
-                    turnSpeedDegPerSec < 45.0 -> 0.44
-                    else -> 0.76
-                }
-                if (turnSpeedDegPerSec < 2.0 && abs(error) < 0.40) previous
-                else BearingMath.normalizeDegrees(previous + error * alpha)
-            }
-        }
+        lastGameHeading = basis.heading
+        lastGameTimestampNs = event.timestamp
     }
 
-    private fun onAbsoluteYaw(magneticYaw: Double) {
-        magneticHeading = magneticYaw
+    private fun onAbsoluteRotation(event: SensorEvent) {
+        val basis = cameraBasisFromRotationVector(event.values)
+        absoluteHeading = basis.heading
         val loc = navigationLocation ?: filteredLocation ?: rawLocation
         val declination = loc?.let {
             GeomagneticField(
-                it.latitude.toFloat(),
-                it.longitude.toFloat(),
+                it.latitude.toFloat(), it.longitude.toFloat(),
                 if (it.hasAltitude()) it.altitude.toFloat() else 0f,
                 System.currentTimeMillis()
             ).declination.toDouble()
         } ?: 0.0
-        val absoluteTrue = BearingMath.normalizeDegrees(magneticYaw + declination)
+        val absoluteTrue = BearingMath.normalizeDegrees(basis.heading + declination)
         trueHeading = absoluteTrue
 
-        val gy = gameYaw
-        if (gy != null) {
-            val measuredOffset = BearingMath.angleDifference(absoluteTrue, gy)
-            absoluteOffset = absoluteOffset?.let { prev ->
-                BearingMath.normalizeSignedDegrees(prev + BearingMath.angleDifference(measuredOffset, prev) * 0.018)
-            } ?: measuredOffset
-            if (fusedHeading == null) fusedHeading = absoluteTrue
-        } else {
-            fusedHeading = absoluteTrue
+        val game = gameBasisRaw
+        if (game != null) {
+            val measured = BearingMath.angleDifference(absoluteTrue, game.heading)
+            headingOffset = headingOffset?.let { prev ->
+                val err = BearingMath.angleDifference(measured, prev)
+                BearingMath.normalizeSignedDegrees(prev + err * 0.018)
+            } ?: measured
         }
+    }
+
+    private fun rotateAroundUp(v: Vec3, deg: Double): Vec3 {
+        val a = Math.toRadians(deg)
+        val c = cos(a)
+        val s = sin(a)
+        return Vec3(v.x * c + v.y * s, -v.x * s + v.y * c, v.z)
+    }
+
+    private fun trueCameraBasis(): CameraBasis? {
+        val game = gameBasisRaw ?: return null
+        val offset = headingOffset ?: return null
+        return CameraBasis(
+            rotateAroundUp(game.right, offset).normalized(),
+            rotateAroundUp(game.up, offset).normalized(),
+            rotateAroundUp(game.forward, offset).normalized(),
+            BearingMath.normalizeDegrees(game.heading + offset)
+        )
     }
 
     private fun acceptLocation(location: Location) {
@@ -288,40 +296,37 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             location.accuracy <= 14f -> "FAIR"
             else -> "POOR"
         }
-
         if (location.accuracy > 35f && filteredLocation != null) {
-            renderState()
-            return
+            renderState(); return
         }
-
         updateFilteredLocation(location)
         updateNavigationLocation(location)
         maybeCreateTestTree()
         recomputeGeometry()
+        updateProjection()
         renderState()
     }
 
     private fun updateFilteredLocation(location: Location) {
         val previous = filteredLocation
-        filteredLocation = if (previous == null) {
-            Location(location)
-        } else {
+        filteredLocation = if (previous == null) Location(location) else {
             val displacement = previous.distanceTo(location).toDouble()
-            val alpha = when {
+            val base = when {
                 location.accuracy <= 4f -> 0.42
                 location.accuracy <= 8f -> 0.28
                 location.accuracy <= 14f -> 0.16
                 else -> 0.08
-            } + when {
+            }
+            val motion = when {
                 location.hasSpeed() && location.speed > 1.6f -> 0.18
                 location.hasSpeed() && location.speed > 0.7f -> 0.10
                 displacement > 5.0 -> 0.12
                 else -> 0.0
             }
-            val boundedAlpha = min(0.65, alpha)
+            val alpha = min(0.65, base + motion)
             Location(location).apply {
-                latitude = previous.latitude + (location.latitude - previous.latitude) * boundedAlpha
-                longitude = previous.longitude + (location.longitude - previous.longitude) * boundedAlpha
+                latitude = previous.latitude + (location.latitude - previous.latitude) * alpha
+                longitude = previous.longitude + (location.longitude - previous.longitude) * alpha
                 accuracy = max(1f, min(previous.accuracy, location.accuracy))
             }
         }
@@ -330,37 +335,22 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private fun updateNavigationLocation(location: Location) {
         val candidate = filteredLocation ?: Location(location)
         val previous = navigationLocation
-        if (previous == null) {
-            navigationLocation = Location(candidate)
-            return
-        }
+        if (previous == null) { navigationLocation = Location(candidate); return }
 
         val displacement = previous.distanceTo(candidate).toDouble()
-        val uncertaintyRadius = max(1.6, min(7.0, location.accuracy * 0.38))
+        val uncertaintyRadius = max(1.8, min(7.0, location.accuracy * 0.42))
         val speed = if (location.hasSpeed()) location.speed.toDouble() else 0.0
-        val moving = speed > 0.45 || displacement > uncertaintyRadius + 1.5
-
+        val moving = speed > 0.45 || displacement > uncertaintyRadius + 1.6
         if (!moving || displacement <= uncertaintyRadius) {
             navigationHoldMeters = displacement
             return
         }
 
-        val trustedMovement = displacement - uncertaintyRadius
-        val movementRatio = (trustedMovement / displacement).coerceIn(0.0, 1.0)
-        val speedWeight = when {
-            speed > 1.8 -> 0.72
-            speed > 1.0 -> 0.58
-            speed > 0.45 -> 0.42
-            else -> 0.30
-        }
-        val accuracyWeight = when {
-            location.accuracy <= 4f -> 1.0
-            location.accuracy <= 8f -> 0.78
-            location.accuracy <= 14f -> 0.52
-            else -> 0.28
-        }
-        val alpha = (movementRatio * speedWeight * accuracyWeight).coerceIn(0.10, 0.65)
-
+        val trusted = (displacement - uncertaintyRadius).coerceAtLeast(0.0)
+        val ratio = (trusted / displacement).coerceIn(0.0, 1.0)
+        val speedWeight = when { speed > 1.8 -> 0.72; speed > 1.0 -> 0.58; speed > 0.45 -> 0.42; else -> 0.30 }
+        val accuracyWeight = when { location.accuracy <= 4f -> 1.0; location.accuracy <= 8f -> 0.78; location.accuracy <= 14f -> 0.52; else -> 0.28 }
+        val alpha = (ratio * speedWeight * accuracyWeight).coerceIn(0.10, 0.65)
         navigationLocation = Location(candidate).apply {
             latitude = previous.latitude + (candidate.latitude - previous.latitude) * alpha
             longitude = previous.longitude + (candidate.longitude - previous.longitude) * alpha
@@ -372,15 +362,15 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private fun maybeCreateTestTree(force: Boolean = false) {
         if (autoTreeCreated && !force) return
         val start = navigationLocation ?: filteredLocation ?: rawLocation ?: return
-        val heading = fusedHeading ?: trueHeading ?: return
+        val heading = trueCameraBasis()?.heading ?: trueHeading ?: return
         if (!force && gpsAccuracy > 16f) return
-
         val dest = destinationPoint(start.latitude, start.longitude, heading, testTreeDistanceMeters)
         treeLat = dest.first
         treeLng = dest.second
         autoTreeCreated = true
         filteredBearing = heading
-        displayDelta = 0.0
+        displayHorizontalDeg = 0.0
+        displayVerticalDeg = 0.0
         recomputeGeometry()
         showToast("Target tree placed 35 m ahead")
     }
@@ -389,117 +379,117 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         val loc = navigationLocation ?: return
         val lat = treeLat ?: return
         val lng = treeLng ?: return
-
         val result = FloatArray(1)
         Location.distanceBetween(loc.latitude, loc.longitude, lat, lng, result)
         distanceToTreeMeters = result[0]
         val distance = max(0.5, result[0].toDouble())
-
         val bearing = BearingMath.bearingDegrees(loc.latitude, loc.longitude, lat, lng)
         rawBearing = bearing
+        bearingUncertaintyDeg = Math.toDegrees(atan2(max(1.0, gpsAccuracy * 0.45).toDouble(), distance)).coerceIn(0.5, 75.0)
+        targetAreaMode = distance <= max(5.0, gpsAccuracy * 1.15)
 
-        bearingUncertaintyDeg = Math.toDegrees(atan2(max(1.0, gpsAccuracy * 0.45).toDouble(), distance))
-            .coerceIn(0.5, 75.0)
-        targetAreaMode = distance <= max(6.0, gpsAccuracy * 1.35)
+        filteredBearing = if (targetAreaMode) filteredBearing ?: bearing else filteredBearing?.let { prev ->
+            val error = BearingMath.angleDifference(bearing, prev)
+            val deadband = max(0.8, bearingUncertaintyDeg * 0.42)
+            if (abs(error) <= deadband) prev else {
+                val alpha = when { gpsAccuracy <= 4f -> 0.26; gpsAccuracy <= 8f -> 0.18; gpsAccuracy <= 14f -> 0.11; else -> 0.06 }
+                BearingMath.normalizeDegrees(prev + error * alpha)
+            }
+        } ?: bearing
+    }
 
-        filteredBearing = if (targetAreaMode) {
-            filteredBearing ?: bearing
-        } else {
-            filteredBearing?.let { prev ->
-                val error = BearingMath.angleDifference(bearing, prev)
-                val deadband = max(0.8, bearingUncertaintyDeg * 0.42)
-                if (abs(error) <= deadband) {
-                    prev
-                } else {
-                    val alpha = when {
-                        gpsAccuracy <= 4f -> 0.26
-                        gpsAccuracy <= 8f -> 0.18
-                        gpsAccuracy <= 14f -> 0.11
-                        else -> 0.06
-                    }
-                    BearingMath.normalizeDegrees(prev + error * alpha)
-                }
-            } ?: bearing
+    private fun updateProjection() {
+        val basis = trueCameraBasis() ?: return
+        val bearing = filteredBearing ?: rawBearing ?: return
+        val br = Math.toRadians(bearing)
+        val target = Vec3(sin(br), cos(br), 0.0).normalized()
+        val cx = target.dot(basis.right)
+        val cy = target.dot(basis.up)
+        val cz = target.dot(basis.forward)
+        targetBehind = cz <= 0.0
+
+        val h = Math.toDegrees(atan2(cx, cz))
+        val v = Math.toDegrees(atan2(cy, sqrt(cx*cx + cz*cz)))
+        latestHorizontalDeg = BearingMath.normalizeSignedDegrees(h)
+        latestVerticalDeg = v.coerceIn(-89.0, 89.0)
+
+        val adaptive = when {
+            turnSpeedDegPerSec < 2.0 -> 0.10
+            turnSpeedDegPerSec < 12.0 -> 0.24
+            turnSpeedDegPerSec < 45.0 -> 0.48
+            else -> 0.78
         }
+        displayHorizontalDeg = smoothSigned(displayHorizontalDeg, latestHorizontalDeg, adaptive, if (turnSpeedDegPerSec < 2.0) 0.35 else 0.08)
+        displayVerticalDeg = smoothLinear(displayVerticalDeg, latestVerticalDeg, adaptive, if (turnSpeedDegPerSec < 2.0) 0.28 else 0.06)
+    }
+
+    private fun smoothSigned(prev: Double?, next: Double?, alpha: Double, deadband: Double): Double? {
+        if (next == null) return prev
+        if (prev == null) return next
+        val error = BearingMath.angleDifference(next, prev)
+        if (abs(error) < deadband) return prev
+        return BearingMath.normalizeSignedDegrees(prev + error * alpha)
+    }
+
+    private fun smoothLinear(prev: Double?, next: Double?, alpha: Double, deadband: Double): Double? {
+        if (next == null) return prev
+        if (prev == null) return next
+        val error = next - prev
+        if (abs(error) < deadband) return prev
+        return prev + error * alpha
     }
 
     private fun renderState() {
-        val heading = fusedHeading ?: trueHeading
-        val bearing = filteredBearing ?: rawBearing
-        val rawDelta = if (heading != null && bearing != null) BearingMath.angleDifference(bearing, heading) else null
-
-        if (rawDelta != null && !targetAreaMode) {
-            displayDelta = displayDelta?.let { prev ->
-                val error = BearingMath.angleDifference(rawDelta, prev)
-                val deadband = when {
-                    turnSpeedDegPerSec < 2.0 -> max(0.45, bearingUncertaintyDeg * 0.20)
-                    else -> 0.25
-                }
-                if (abs(error) <= deadband) {
-                    prev
-                } else {
-                    val alpha = when {
-                        turnSpeedDegPerSec < 2.0 -> 0.06
-                        turnSpeedDegPerSec < 12.0 -> 0.18
-                        turnSpeedDegPerSec < 45.0 -> 0.42
-                        else -> 0.74
-                    }
-                    BearingMath.normalizeSignedDegrees(prev + error * alpha)
-                }
-            } ?: rawDelta
-        }
-
-        val delta = displayDelta
+        val basis = trueCameraBasis()
         val distance = distanceToTreeMeters
         overlay.updateTarget(
-            deltaDegrees = delta,
+            horizontalDegrees = displayHorizontalDeg,
+            verticalDegrees = displayVerticalDeg,
             distanceMeters = distance?.toDouble(),
             gpsQuality = locationQuality,
-            ready = treeLat != null && heading != null,
+            ready = treeLat != null && basis != null,
             targetArea = targetAreaMode,
-            uncertaintyDegrees = bearingUncertaintyDeg
+            uncertaintyDegrees = bearingUncertaintyDeg,
+            behind = targetBehind
         )
 
         tvDistance.text = distance?.let { if (it < 10f) String.format("%.1f m", it) else String.format("%.0f m", it) } ?: "-- m"
+        val h = displayHorizontalDeg
         tvDirection.text = when {
-            treeLat == null || heading == null -> "Acquiring location & heading…"
+            treeLat == null || basis == null -> "Acquiring location & heading…"
             targetAreaMode -> "Target area reached"
-            delta == null -> "Acquiring direction…"
-            abs(delta) <= 3.0 -> "Tree is ahead"
-            abs(delta) >= 150.0 -> "Tree is behind you"
-            delta < 0 -> "Turn left ${abs(delta).toInt()}°"
-            else -> "Turn right ${abs(delta).toInt()}°"
+            targetBehind -> "Tree is behind you"
+            h == null -> "Acquiring direction…"
+            abs(h) <= 3.0 -> "Tree is ahead"
+            h < 0 -> "Turn left ${abs(h).toInt()}°"
+            else -> "Turn right ${abs(h).toInt()}°"
         }
-        tvGpsStatus.text = "GPS  $locationQuality  ${if (gpsAccuracy < Float.MAX_VALUE) String.format("±%.0f m", gpsAccuracy) else ""}"
-        tvCompassStatus.text = "HEADING  ${headingQuality()}"
-        tvCoordinates.text = if (treeLat != null && treeLng != null) {
-            String.format("Target  %.6f, %.6f", treeLat, treeLng)
-        } else "Waiting for a reliable fix to create target…"
+        tvGpsStatus.text = "GPS ${locationQuality}  ${if (gpsAccuracy < Float.MAX_VALUE) String.format("±%.0f m", gpsAccuracy) else ""}"
+        tvCompassStatus.text = "HEADING ${headingQuality()}"
+        tvCoordinates.text = if (treeLat != null && treeLng != null) String.format("Target %.6f, %.6f", treeLat, treeLng) else "Acquiring target…"
 
         tvDebug.text = buildString {
-            appendLine("TRACKING ENGINE")
-            appendLine("Game yaw         : ${fmt(gameYaw)}°")
-            appendLine("Magnetic         : ${fmt(magneticHeading)}°")
-            appendLine("True heading     : ${fmt(trueHeading)}°")
-            appendLine("Fused heading    : ${fmt(fusedHeading)}°")
-            appendLine("Turn speed       : ${String.format("%.1f", turnSpeedDegPerSec)}°/s")
-            appendLine("Raw bearing      : ${fmt(rawBearing)}°")
-            appendLine("Filtered bearing : ${fmt(filteredBearing)}°")
-            appendLine("Display delta    : ${fmt(displayDelta)}°")
-            appendLine("Bearing uncertainty: ±${String.format("%.1f", bearingUncertaintyDeg)}°")
-            appendLine("Target area mode : $targetAreaMode")
-            appendLine("GPS quality      : $locationQuality / ${if (gpsAccuracy < Float.MAX_VALUE) String.format("±%.1f m", gpsAccuracy) else "--"}")
-            appendLine("Navigation hold  : ${String.format("%.1f", navigationHoldMeters)} m")
-            appendLine("Raw phone        : ${locText(rawLocation)}")
-            appendLine("Filtered phone   : ${locText(filteredLocation)}")
-            appendLine("Navigation phone : ${locText(navigationLocation)}")
-            append("Tree fixed       : ${treeLat?.let { String.format("%.7f", it) } ?: "--"}, ${treeLng?.let { String.format("%.7f", it) } ?: "--"}")
+            appendLine("TRACKING ENGINE · 3D PROJECTION")
+            appendLine("True camera heading : ${fmt(basis?.heading)}°")
+            appendLine("Turn speed          : ${String.format("%.1f", turnSpeedDegPerSec)}°/s")
+            appendLine("Raw bearing         : ${fmt(rawBearing)}°")
+            appendLine("Filtered bearing    : ${fmt(filteredBearing)}°")
+            appendLine("Horizontal angle    : ${fmt(latestHorizontalDeg)}°")
+            appendLine("Vertical angle      : ${fmt(latestVerticalDeg)}°")
+            appendLine("Displayed X angle   : ${fmt(displayHorizontalDeg)}°")
+            appendLine("Displayed Y angle   : ${fmt(displayVerticalDeg)}°")
+            appendLine("Behind camera       : $targetBehind")
+            appendLine("Bearing uncertainty : ±${String.format("%.1f", bearingUncertaintyDeg)}°")
+            appendLine("GPS quality         : $locationQuality / ${if (gpsAccuracy < Float.MAX_VALUE) String.format("±%.1f m", gpsAccuracy) else "--"}")
+            appendLine("Navigation hold     : ${String.format("%.1f", navigationHoldMeters)} m")
+            appendLine("Navigation phone    : ${locText(navigationLocation)}")
+            append("Tree fixed          : ${treeLat?.let { String.format("%.7f", it) } ?: "--"}, ${treeLng?.let { String.format("%.7f", it) } ?: "--"}")
         }
     }
 
     private fun headingQuality(): String = when {
         headingAccuracy == SensorManager.SENSOR_STATUS_UNRELIABLE -> "CALIBRATE"
-        absoluteOffset == null -> "ACQUIRING"
+        headingOffset == null -> "ACQUIRING"
         else -> "GOOD"
     }
 
