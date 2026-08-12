@@ -17,12 +17,10 @@ import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
+import kotlin.math.atan2
 import kotlin.math.sqrt
 
-/**
- * ARCore camera + world-anchor renderer.
- * GPS never moves the visual target while the AR anchor is tracking.
- */
+/** ARCore camera + world-anchor projection. GPS never repositions the anchor. */
 class ArCoreCameraView @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null
@@ -35,6 +33,8 @@ class ArCoreCameraView @JvmOverloads constructor(
         val screenY: Float?,
         val inFront: Boolean,
         val distanceMeters: Float?,
+        val horizontalAngleDeg: Double?,
+        val verticalAngleDeg: Double?,
         val cameraTrackingState: TrackingState
     )
 
@@ -47,21 +47,16 @@ class ArCoreCameraView @JvmOverloads constructor(
     private var surfaceWidth = 1
     private var surfaceHeight = 1
     private var displayRotation = 0
-    private var pendingAnchorDistanceMeters: Float? = null
+    private var pendingAnchor: Pair<Float, Float>? = null
 
-    private val quadVertices = floatArrayOf(
-        -1f, -1f,
-         1f, -1f,
-        -1f,  1f,
-         1f,  1f
-    )
-    private val quadBuffer: FloatBuffer = floatBuffer(quadVertices)
+    private val quadVertices = floatArrayOf(-1f,-1f, 1f,-1f, -1f,1f, 1f,1f)
+    private val quadBuffer = floatBuffer(quadVertices)
     private val transformedUv = FloatArray(8)
-    private val transformedUvBuffer: FloatBuffer = floatBuffer(FloatArray(8))
+    private val transformedUvBuffer = floatBuffer(FloatArray(8))
 
     init {
         setEGLContextClientVersion(2)
-        setEGLConfigChooser(8, 8, 8, 8, 16, 0)
+        setEGLConfigChooser(8,8,8,8,16,0)
         preserveEGLContextOnPause = true
         setRenderer(this)
         renderMode = RENDERMODE_CONTINUOUSLY
@@ -70,18 +65,13 @@ class ArCoreCameraView @JvmOverloads constructor(
     fun attachSession(arSession: Session) {
         session = arSession
         queueEvent {
-            if (textureId != -1) {
-                arSession.setCameraTextureName(textureId)
-                arSession.setDisplayGeometry(displayRotation, surfaceWidth, surfaceHeight)
-            }
+            if (textureId != -1) arSession.setCameraTextureName(textureId)
+            arSession.setDisplayGeometry(displayRotation, surfaceWidth, surfaceHeight)
         }
     }
 
     fun detachSession() {
-        queueEvent {
-            targetAnchor?.detach()
-            targetAnchor = null
-        }
+        queueEvent { targetAnchor?.detach(); targetAnchor = null; pendingAnchor = null }
         session = null
     }
 
@@ -90,75 +80,61 @@ class ArCoreCameraView @JvmOverloads constructor(
         queueEvent { session?.setDisplayGeometry(rotation, surfaceWidth, surfaceHeight) }
     }
 
-    fun placeTargetAhead(distanceMeters: Float) {
-        pendingAnchorDistanceMeters = distanceMeters
+    fun placeTargetAhead(distanceMeters: Float, elevationOffsetMeters: Float = 0f) {
+        pendingAnchor = distanceMeters.coerceIn(1f, 150f) to elevationOffsetMeters.coerceIn(-20f,20f)
     }
 
     fun clearTargetAnchor() {
-        queueEvent {
-            targetAnchor?.detach()
-            targetAnchor = null
-            pendingAnchorDistanceMeters = null
-        }
+        queueEvent { targetAnchor?.detach(); targetAnchor = null; pendingAnchor = null }
     }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
-        GLES20.glClearColor(0f, 0f, 0f, 1f)
+        GLES20.glClearColor(0f,0f,0f,1f)
         textureId = createExternalTexture()
         program = createProgram(VERTEX_SHADER, FRAGMENT_SHADER)
         session?.setCameraTextureName(textureId)
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
-        surfaceWidth = width.coerceAtLeast(1)
-        surfaceHeight = height.coerceAtLeast(1)
-        GLES20.glViewport(0, 0, surfaceWidth, surfaceHeight)
-        session?.setDisplayGeometry(displayRotation, surfaceWidth, surfaceHeight)
+        surfaceWidth = width.coerceAtLeast(1); surfaceHeight = height.coerceAtLeast(1)
+        GLES20.glViewport(0,0,surfaceWidth,surfaceHeight)
+        session?.setDisplayGeometry(displayRotation,surfaceWidth,surfaceHeight)
     }
 
     override fun onDrawFrame(gl: GL10?) {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
-        val arSession = session ?: return
+        val s = session ?: return
         if (textureId == -1) return
-
         try {
-            arSession.setCameraTextureName(textureId)
-            val frame = arSession.update()
+            s.setCameraTextureName(textureId)
+            val frame = s.update()
             drawCameraBackground(frame)
-
             if (frame.camera.trackingState == TrackingState.TRACKING) {
-                pendingAnchorDistanceMeters?.let { distance ->
-                    createAnchorAhead(arSession, frame, distance)
-                    pendingAnchorDistanceMeters = null
+                pendingAnchor?.let { (distance,elevation) ->
+                    createAnchorAhead(s, frame, distance, elevation)
+                    pendingAnchor = null
                 }
             }
             emitFrameState(frame)
         } catch (_: Throwable) {
-            // Session may transition during GLSurfaceView lifecycle changes. Skip the frame rather
-            // than crashing; Activity handles visible ARCore status and recovery.
+            // Session can transition during lifecycle changes; skip this frame.
         }
     }
 
-    private fun createAnchorAhead(arSession: Session, frame: Frame, distance: Float) {
+    private fun createAnchorAhead(s: Session, frame: Frame, distance: Float, elevation: Float) {
         targetAnchor?.detach()
         val pose = frame.camera.pose
-        val translation = pose.translation
-        val zAxis = pose.zAxis
-
-        // ARCore camera looks along -Z. Project its forward vector onto the horizontal plane so
-        // pitching the phone at creation time does not move the synthetic tree above/below ground.
-        var fx = -zAxis[0]
-        var fz = -zAxis[2]
-        val len = sqrt(fx * fx + fz * fz).coerceAtLeast(0.0001f)
-        fx /= len
-        fz /= len
-
-        val targetPose = Pose.makeTranslation(
-            translation[0] + fx * distance,
-            translation[1],
-            translation[2] + fz * distance
-        )
-        targetAnchor = arSession.createAnchor(targetPose)
+        val t = pose.translation
+        val z = pose.zAxis
+        var fx = -z[0]
+        var fz = -z[2]
+        val len = sqrt(fx*fx + fz*fz).coerceAtLeast(0.0001f)
+        fx /= len; fz /= len
+        targetAnchor = s.createAnchor(Pose.makeTranslation(
+            t[0] + fx * distance,
+            t[1] + elevation,
+            t[2] + fz * distance
+        ))
     }
 
     private fun emitFrameState(frame: Frame) {
@@ -166,145 +142,83 @@ class ArCoreCameraView @JvmOverloads constructor(
         val tracking = camera.trackingState == TrackingState.TRACKING
         val anchor = targetAnchor
         if (!tracking || anchor == null || anchor.trackingState != TrackingState.TRACKING) {
-            post {
-                onFrameState?.invoke(
-                    FrameState(
-                        tracking = tracking,
-                        anchorReady = anchor != null,
-                        screenX = null,
-                        screenY = null,
-                        inFront = false,
-                        distanceMeters = null,
-                        cameraTrackingState = camera.trackingState
-                    )
-                )
-            }
+            post { onFrameState?.invoke(FrameState(
+                tracking, anchor != null, null, null, false, null, null, null, camera.trackingState
+            )) }
             return
         }
 
-        val anchorT = anchor.pose.translation
-        val cameraT = camera.pose.translation
-        val dx = anchorT[0] - cameraT[0]
-        val dy = anchorT[1] - cameraT[1]
-        val dz = anchorT[2] - cameraT[2]
-        val distance = sqrt(dx * dx + dy * dy + dz * dz)
+        val a = anchor.pose.translation
+        val ct = camera.pose.translation
+        val dx = a[0]-ct[0]; val dy=a[1]-ct[1]; val dz=a[2]-ct[2]
+        val distance = sqrt(dx*dx + dy*dy + dz*dz)
 
-        val world = floatArrayOf(anchorT[0], anchorT[1], anchorT[2], 1f)
-        val view = FloatArray(16)
-        val projection = FloatArray(16)
-        val cameraSpace = FloatArray(4)
-        val clip = FloatArray(4)
-        camera.getViewMatrix(view, 0)
-        camera.getProjectionMatrix(projection, 0, 0.05f, 250f)
-        Matrix.multiplyMV(cameraSpace, 0, view, 0, world, 0)
-        Matrix.multiplyMV(clip, 0, projection, 0, cameraSpace, 0)
+        val world = floatArrayOf(a[0],a[1],a[2],1f)
+        val view=FloatArray(16); val projection=FloatArray(16)
+        val cameraSpace=FloatArray(4); val clip=FloatArray(4)
+        camera.getViewMatrix(view,0)
+        camera.getProjectionMatrix(projection,0,0.05f,250f)
+        Matrix.multiplyMV(cameraSpace,0,view,0,world,0)
+        Matrix.multiplyMV(clip,0,projection,0,cameraSpace,0)
 
-        val inFront = clip[3] > 0.0001f
-        val x = if (inFront) ((clip[0] / clip[3]) + 1f) * 0.5f else null
-        val y = if (inFront) 1f - (((clip[1] / clip[3]) + 1f) * 0.5f) else null
+        val inFront = cameraSpace[2] < -0.001f && clip[3] > 0.0001f
+        val x = if(inFront) ((clip[0]/clip[3])+1f)*0.5f else null
+        val y = if(inFront) 1f-(((clip[1]/clip[3])+1f)*0.5f) else null
+        val horizontal = Math.toDegrees(atan2(cameraSpace[0].toDouble(), (-cameraSpace[2]).toDouble()))
+        val ground = sqrt(cameraSpace[0]*cameraSpace[0] + cameraSpace[2]*cameraSpace[2]).coerceAtLeast(0.0001f)
+        val vertical = Math.toDegrees(atan2(cameraSpace[1].toDouble(), ground.toDouble()))
 
-        post {
-            onFrameState?.invoke(
-                FrameState(
-                    tracking = true,
-                    anchorReady = true,
-                    screenX = x,
-                    screenY = y,
-                    inFront = inFront,
-                    distanceMeters = distance,
-                    cameraTrackingState = camera.trackingState
-                )
-            )
-        }
+        post { onFrameState?.invoke(FrameState(
+            true,true,x,y,inFront,distance,horizontal,vertical,camera.trackingState
+        )) }
     }
 
     private fun drawCameraBackground(frame: Frame) {
         frame.transformCoordinates2d(
-            Coordinates2d.OPENGL_NORMALIZED_DEVICE_COORDINATES,
-            quadVertices,
-            Coordinates2d.TEXTURE_NORMALIZED,
-            transformedUv
+            Coordinates2d.OPENGL_NORMALIZED_DEVICE_COORDINATES, quadVertices,
+            Coordinates2d.TEXTURE_NORMALIZED, transformedUv
         )
-        transformedUvBuffer.position(0)
-        transformedUvBuffer.put(transformedUv)
-        transformedUvBuffer.position(0)
+        transformedUvBuffer.position(0); transformedUvBuffer.put(transformedUv); transformedUvBuffer.position(0)
         quadBuffer.position(0)
-
         GLES20.glDisable(GLES20.GL_DEPTH_TEST)
         GLES20.glUseProgram(program)
-        val pos = GLES20.glGetAttribLocation(program, "a_Position")
-        val uv = GLES20.glGetAttribLocation(program, "a_TexCoord")
-        val texture = GLES20.glGetUniformLocation(program, "u_Texture")
-
-        GLES20.glEnableVertexAttribArray(pos)
-        GLES20.glVertexAttribPointer(pos, 2, GLES20.GL_FLOAT, false, 0, quadBuffer)
-        GLES20.glEnableVertexAttribArray(uv)
-        GLES20.glVertexAttribPointer(uv, 2, GLES20.GL_FLOAT, false, 0, transformedUvBuffer)
-        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
-        GLES20.glUniform1i(texture, 0)
-        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
-        GLES20.glDisableVertexAttribArray(pos)
-        GLES20.glDisableVertexAttribArray(uv)
-        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
+        val pos=GLES20.glGetAttribLocation(program,"a_Position")
+        val uv=GLES20.glGetAttribLocation(program,"a_TexCoord")
+        val texture=GLES20.glGetUniformLocation(program,"u_Texture")
+        GLES20.glEnableVertexAttribArray(pos); GLES20.glVertexAttribPointer(pos,2,GLES20.GL_FLOAT,false,0,quadBuffer)
+        GLES20.glEnableVertexAttribArray(uv); GLES20.glVertexAttribPointer(uv,2,GLES20.GL_FLOAT,false,0,transformedUvBuffer)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0); GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,textureId)
+        GLES20.glUniform1i(texture,0); GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP,0,4)
+        GLES20.glDisableVertexAttribArray(pos); GLES20.glDisableVertexAttribArray(uv)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,0)
     }
 
     private fun createExternalTexture(): Int {
-        val textures = IntArray(1)
-        GLES20.glGenTextures(1, textures, 0)
-        val id = textures[0]
-        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, id)
-        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
-        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
-        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
-        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        val ids=IntArray(1); GLES20.glGenTextures(1,ids,0); val id=ids[0]
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,id)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GLES20.GL_TEXTURE_MIN_FILTER,GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GLES20.GL_TEXTURE_MAG_FILTER,GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GLES20.GL_TEXTURE_WRAP_S,GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GLES20.GL_TEXTURE_WRAP_T,GLES20.GL_CLAMP_TO_EDGE)
         return id
     }
 
-    private fun createProgram(vertex: String, fragment: String): Int {
-        val vertexShader = compileShader(GLES20.GL_VERTEX_SHADER, vertex)
-        val fragmentShader = compileShader(GLES20.GL_FRAGMENT_SHADER, fragment)
-        val result = GLES20.glCreateProgram()
-        GLES20.glAttachShader(result, vertexShader)
-        GLES20.glAttachShader(result, fragmentShader)
-        GLES20.glLinkProgram(result)
-        GLES20.glDeleteShader(vertexShader)
-        GLES20.glDeleteShader(fragmentShader)
-        return result
+    private fun createProgram(v:String,f:String):Int{
+        val vs=compileShader(GLES20.GL_VERTEX_SHADER,v); val fs=compileShader(GLES20.GL_FRAGMENT_SHADER,f)
+        return GLES20.glCreateProgram().also{GLES20.glAttachShader(it,vs);GLES20.glAttachShader(it,fs);GLES20.glLinkProgram(it);GLES20.glDeleteShader(vs);GLES20.glDeleteShader(fs)}
     }
-
-    private fun compileShader(type: Int, source: String): Int {
-        val shader = GLES20.glCreateShader(type)
-        GLES20.glShaderSource(shader, source)
-        GLES20.glCompileShader(shader)
-        return shader
-    }
-
-    private fun floatBuffer(values: FloatArray): FloatBuffer =
-        ByteBuffer.allocateDirect(values.size * 4)
-            .order(ByteOrder.nativeOrder())
-            .asFloatBuffer()
-            .apply { put(values); position(0) }
+    private fun compileShader(type:Int,source:String):Int=GLES20.glCreateShader(type).also{GLES20.glShaderSource(it,source);GLES20.glCompileShader(it)}
+    private fun floatBuffer(v:FloatArray):FloatBuffer=ByteBuffer.allocateDirect(v.size*4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply{put(v);position(0)}
 
     companion object {
-        private const val VERTEX_SHADER = """
-            attribute vec4 a_Position;
-            attribute vec2 a_TexCoord;
-            varying vec2 v_TexCoord;
-            void main() {
-                gl_Position = a_Position;
-                v_TexCoord = a_TexCoord;
-            }
+        private const val VERTEX_SHADER="""
+            attribute vec4 a_Position; attribute vec2 a_TexCoord; varying vec2 v_TexCoord;
+            void main(){ gl_Position=a_Position; v_TexCoord=a_TexCoord; }
         """
-
-        private const val FRAGMENT_SHADER = """
+        private const val FRAGMENT_SHADER="""
             #extension GL_OES_EGL_image_external : require
-            precision mediump float;
-            uniform samplerExternalOES u_Texture;
-            varying vec2 v_TexCoord;
-            void main() {
-                gl_FragColor = texture2D(u_Texture, v_TexCoord);
-            }
+            precision mediump float; uniform samplerExternalOES u_Texture; varying vec2 v_TexCoord;
+            void main(){ gl_FragColor=texture2D(u_Texture,v_TexCoord); }
         """
     }
 }
