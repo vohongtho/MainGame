@@ -7,9 +7,12 @@ import kotlin.math.sin
 object BearingMath {
     fun normalizeDegrees(value: Double): Double = ((value % 360.0) + 360.0) % 360.0
 
+    fun normalizeSignedDegrees(value: Double): Double =
+        ((value + 540.0) % 360.0) - 180.0
+
     /** Signed shortest angle from current to target, in [-180, 180). */
     fun angleDifference(target: Double, current: Double): Double =
-        ((target - current + 540.0) % 360.0) - 180.0
+        normalizeSignedDegrees(target - current)
 
     fun bearingDegrees(
         fromLat: Double,
