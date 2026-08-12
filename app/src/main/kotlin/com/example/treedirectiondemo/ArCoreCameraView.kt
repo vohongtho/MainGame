@@ -1,6 +1,5 @@
 package com.example.treedirectiondemo
 
-import android.app.Activity
 import android.content.Context
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
@@ -21,10 +20,8 @@ import javax.microedition.khronos.opengles.GL10
 import kotlin.math.sqrt
 
 /**
- * Minimal ARCore camera surface used by Tree Navigator.
- *
- * ARCore owns the camera and visual-inertial world tracking. A target tree is represented by a
- * real ARCore Anchor, so GPS updates never move the visual marker while AR tracking is healthy.
+ * ARCore camera + world-anchor renderer.
+ * GPS never moves the visual target while the AR anchor is tracking.
  */
 class ArCoreCameraView @JvmOverloads constructor(
     context: Context,
@@ -45,7 +42,6 @@ class ArCoreCameraView @JvmOverloads constructor(
 
     private var session: Session? = null
     private var targetAnchor: Anchor? = null
-    private var latestFrame: Frame? = null
     private var textureId = -1
     private var program = 0
     private var surfaceWidth = 1
@@ -85,7 +81,6 @@ class ArCoreCameraView @JvmOverloads constructor(
         queueEvent {
             targetAnchor?.detach()
             targetAnchor = null
-            latestFrame = null
         }
         session = null
     }
@@ -95,7 +90,6 @@ class ArCoreCameraView @JvmOverloads constructor(
         queueEvent { session?.setDisplayGeometry(rotation, surfaceWidth, surfaceHeight) }
     }
 
-    /** Places the anchor on the horizontal plane in front of the current AR camera. */
     fun placeTargetAhead(distanceMeters: Float) {
         pendingAnchorDistanceMeters = distanceMeters
     }
@@ -130,21 +124,18 @@ class ArCoreCameraView @JvmOverloads constructor(
         try {
             arSession.setCameraTextureName(textureId)
             val frame = arSession.update()
-            latestFrame = frame
             drawCameraBackground(frame)
 
-            val camera = frame.camera
-            if (camera.trackingState == TrackingState.TRACKING) {
+            if (frame.camera.trackingState == TrackingState.TRACKING) {
                 pendingAnchorDistanceMeters?.let { distance ->
                     createAnchorAhead(arSession, frame, distance)
                     pendingAnchorDistanceMeters = null
                 }
             }
-
             emitFrameState(frame)
         } catch (_: Throwable) {
-            // Session lifecycle can transition while GLSurfaceView is drawing. The Activity owns
-            // user-visible error handling; skipping one frame is safer than crashing the render loop.
+            // Session may transition during GLSurfaceView lifecycle changes. Skip the frame rather
+            // than crashing; Activity handles visible ARCore status and recovery.
         }
     }
 
@@ -152,11 +143,10 @@ class ArCoreCameraView @JvmOverloads constructor(
         targetAnchor?.detach()
         val pose = frame.camera.pose
         val translation = pose.translation
-        val zAxis = FloatArray(3)
-        pose.getZAxis(zAxis, 0)
+        val zAxis = pose.zAxis
 
-        // ARCore camera looks along -Z. Remove vertical pitch so the synthetic tree is placed on
-        // the horizontal direction the user is facing, rather than above/below ground.
+        // ARCore camera looks along -Z. Project its forward vector onto the horizontal plane so
+        // pitching the phone at creation time does not move the synthetic tree above/below ground.
         var fx = -zAxis[0]
         var fz = -zAxis[2]
         val len = sqrt(fx * fx + fz * fz).coerceAtLeast(0.0001f)
@@ -250,12 +240,10 @@ class ArCoreCameraView @JvmOverloads constructor(
         GLES20.glVertexAttribPointer(pos, 2, GLES20.GL_FLOAT, false, 0, quadBuffer)
         GLES20.glEnableVertexAttribArray(uv)
         GLES20.glVertexAttribPointer(uv, 2, GLES20.GL_FLOAT, false, 0, transformedUvBuffer)
-
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
         GLES20.glUniform1i(texture, 0)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
-
         GLES20.glDisableVertexAttribArray(pos)
         GLES20.glDisableVertexAttribArray(uv)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
@@ -276,13 +264,13 @@ class ArCoreCameraView @JvmOverloads constructor(
     private fun createProgram(vertex: String, fragment: String): Int {
         val vertexShader = compileShader(GLES20.GL_VERTEX_SHADER, vertex)
         val fragmentShader = compileShader(GLES20.GL_FRAGMENT_SHADER, fragment)
-        val p = GLES20.glCreateProgram()
-        GLES20.glAttachShader(p, vertexShader)
-        GLES20.glAttachShader(p, fragmentShader)
-        GLES20.glLinkProgram(p)
+        val result = GLES20.glCreateProgram()
+        GLES20.glAttachShader(result, vertexShader)
+        GLES20.glAttachShader(result, fragmentShader)
+        GLES20.glLinkProgram(result)
         GLES20.glDeleteShader(vertexShader)
         GLES20.glDeleteShader(fragmentShader)
-        return p
+        return result
     }
 
     private fun compileShader(type: Int, source: String): Int {
