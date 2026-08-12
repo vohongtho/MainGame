@@ -29,9 +29,18 @@ class TreeOverlayView @JvmOverloads constructor(
     private var arInFront = false
     private var showDistance = true
     private var showGuidance = true
+    private var microStabilizationEnabled = true
 
     private var smoothX: Float? = null
     private var smoothY: Float? = null
+
+    fun setMicroStabilizationEnabled(enabled: Boolean) {
+        microStabilizationEnabled = enabled
+        if (!enabled) {
+            smoothX = null
+            smoothY = null
+        }
+    }
 
     fun updateTarget(
         directionDegrees: Double?,
@@ -72,11 +81,8 @@ class TreeOverlayView @JvmOverloads constructor(
             return
         }
 
-        if (arTracking) {
-            drawArTarget(canvas, cx, reticleY)
-        } else {
-            drawFallbackTarget(canvas, cx, reticleY)
-        }
+        if (arTracking) drawArTarget(canvas, cx, reticleY)
+        else drawFallbackTarget(canvas, cx, reticleY)
     }
 
     private fun drawArTarget(canvas: Canvas, cx: Float, cy: Float) {
@@ -87,30 +93,32 @@ class TreeOverlayView @JvmOverloads constructor(
             return
         }
 
-        // ARCore already performs visual-inertial smoothing. Keep only a tiny display deadband so
-        // sub-pixel pose noise does not shimmer, without introducing the lag of GPS-style filters.
         val targetX = rawX * width
         val targetY = rawY * height
-        val previousX = smoothX
-        val previousY = smoothY
-        smoothX = if (previousX == null || abs(targetX - previousX) > 2.5f) {
-            if (previousX == null) targetX else previousX + (targetX - previousX) * 0.72f
-        } else previousX
-        smoothY = if (previousY == null || abs(targetY - previousY) > 2.5f) {
-            if (previousY == null) targetY else previousY + (targetY - previousY) * 0.72f
-        } else previousY
 
-        val x = smoothX ?: targetX
-        val y = smoothY ?: targetY
+        val x: Float
+        val y: Float
+        if (microStabilizationEnabled) {
+            val previousX = smoothX
+            val previousY = smoothY
+            smoothX = if (previousX == null || abs(targetX - previousX) > 2.5f) {
+                if (previousX == null) targetX else previousX + (targetX - previousX) * 0.72f
+            } else previousX
+            smoothY = if (previousY == null || abs(targetY - previousY) > 2.5f) {
+                if (previousY == null) targetY else previousY + (targetY - previousY) * 0.72f
+            } else previousY
+            x = smoothX ?: targetX
+            y = smoothY ?: targetY
+        } else {
+            x = targetX
+            y = targetY
+        }
+
         val visible = x in -40f..(width + 40f) && y in 120f..(height * 0.70f)
         if (visible) {
             drawVisibleTarget(canvas, x.coerceIn(90f, width - 90f), y.coerceIn(190f, height * 0.66f))
         } else {
-            drawEdgeIndicator(
-                canvas,
-                x.coerceIn(58f, width - 58f),
-                y.coerceIn(180f, height * 0.66f)
-            )
+            drawEdgeIndicator(canvas, x.coerceIn(58f, width - 58f), y.coerceIn(180f, height * 0.66f))
         }
     }
 
@@ -122,11 +130,9 @@ class TreeOverlayView @JvmOverloads constructor(
         }
         val halfFov = 31.0
         val visible = abs(delta) <= halfFov
-        val x = if (visible) {
-            (cx + (delta / (halfFov * 2.0)) * width).toFloat()
-        } else if (delta < 0) 58f else width - 58f
-        if (visible) drawVisibleTarget(canvas, x, cy)
-        else drawEdgeIndicator(canvas, x, cy)
+        val x = if (visible) (cx + (delta / (halfFov * 2.0)) * width).toFloat()
+        else if (delta < 0) 58f else width - 58f
+        if (visible) drawVisibleTarget(canvas, x, cy) else drawEdgeIndicator(canvas, x, cy)
     }
 
     private fun accentColor(): Int = when (gpsQuality) {
@@ -147,12 +153,10 @@ class TreeOverlayView @JvmOverloads constructor(
 
     private fun drawVisibleTarget(canvas: Canvas, x: Float, y: Float) {
         val accent = accentColor()
-
         paint.style = Paint.Style.FILL
         paint.color = Color.argb(220, 5, 12, 8)
         canvas.drawRoundRect(RectF(x - 74f, y - 110f, x + 74f, y + 98f), 26f, 26f, paint)
 
-        // Map-pin silhouette from the approved mockup.
         paint.color = accent
         val pin = Path().apply {
             moveTo(x, y - 108f)
@@ -192,22 +196,14 @@ class TreeOverlayView @JvmOverloads constructor(
         val path = Path()
         if (horizontal) {
             if (x < width / 2f) {
-                path.moveTo(x - 30f, y)
-                path.lineTo(x - 4f, y - 19f)
-                path.lineTo(x - 4f, y + 19f)
+                path.moveTo(x - 30f, y); path.lineTo(x - 4f, y - 19f); path.lineTo(x - 4f, y + 19f)
             } else {
-                path.moveTo(x + 30f, y)
-                path.lineTo(x + 4f, y - 19f)
-                path.lineTo(x + 4f, y + 19f)
+                path.moveTo(x + 30f, y); path.lineTo(x + 4f, y - 19f); path.lineTo(x + 4f, y + 19f)
             }
         } else if (y < height / 2f) {
-            path.moveTo(x, y - 27f)
-            path.lineTo(x - 19f, y)
-            path.lineTo(x + 19f, y)
+            path.moveTo(x, y - 27f); path.lineTo(x - 19f, y); path.lineTo(x + 19f, y)
         } else {
-            path.moveTo(x, y + 27f)
-            path.lineTo(x - 19f, y)
-            path.lineTo(x + 19f, y)
+            path.moveTo(x, y + 27f); path.lineTo(x - 19f, y); path.lineTo(x + 19f, y)
         }
         path.close()
         canvas.drawPath(path, paint)
@@ -267,10 +263,7 @@ class TreeOverlayView @JvmOverloads constructor(
         val nx = cx + cos(needleAngle).toFloat() * (radius - 23f)
         val ny = cy + sin(needleAngle).toFloat() * (radius - 23f)
         val arrow = Path().apply {
-            moveTo(nx, ny - 14f)
-            lineTo(nx - 9f, ny + 10f)
-            lineTo(nx + 9f, ny + 10f)
-            close()
+            moveTo(nx, ny - 14f); lineTo(nx - 9f, ny + 10f); lineTo(nx + 9f, ny + 10f); close()
         }
         canvas.drawPath(arrow, paint)
 
