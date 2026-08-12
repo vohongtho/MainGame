@@ -26,7 +26,7 @@
         android:background="#B0000000"
         android:fontFamily="monospace"
         android:padding="10dp"
-        android:text="Waiting for camera / GPS / compass..."
+        android:text="Waiting for GPS + compass..."
         android:textColor="#FFFFFF"
         android:textSize="12sp" />
 
@@ -41,7 +41,7 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Tree setup"
+            android:text="Fixed test tree (auto-created 35m ahead at startup)"
             android:textColor="#FFFFFF"
             android:textStyle="bold" />
 
@@ -57,7 +57,6 @@
                 android:layout_weight="1"
                 android:hint="Tree lat"
                 android:inputType="numberDecimal|numberSigned"
-                android:text="1.300500"
                 android:textColor="#FFFFFF"
                 android:textColorHint="#AAAAAA" />
 
@@ -68,7 +67,6 @@
                 android:layout_weight="1"
                 android:hint="Tree lng"
                 android:inputType="numberDecimal|numberSigned"
-                android:text="103.800600"
                 android:textColor="#FFFFFF"
                 android:textColorHint="#AAAAAA" />
         </LinearLayout>
@@ -83,9 +81,8 @@
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:hint="Captured compass bearing"
+                android:hint="Initial compass bearing"
                 android:inputType="numberDecimal|numberSigned"
-                android:text="72.0"
                 android:textColor="#FFFFFF"
                 android:textColorHint="#AAAAAA" />
 
@@ -93,7 +90,7 @@
                 android:id="@+id/btnApply"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="Apply" />
+                android:text="Apply GPS" />
         </LinearLayout>
 
         <LinearLayout
@@ -106,7 +103,7 @@
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:text="LOCK SETUP BEARING" />
+                android:text="RESET TREE 35M AHEAD" />
 
             <Button
                 android:id="@+id/btnJitter"
@@ -121,7 +118,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:paddingTop="4dp"
-            android:text="Unlocked: marker follows live GPS bearing. Locked: marker follows captured bearing only; GPS continues updating."
+            android:text="Tree lat/lng stays fixed. Phone GPS keeps updating. Walk past the tree: current bearing should flip and the camera marker should move behind you, forcing you to turn around."
             android:textColor="#DDFFFFFF"
             android:textSize="11sp" />
     </LinearLayout>
