@@ -3,7 +3,7 @@
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="#07100B">
+    android:background="#050A07">
 
     <androidx.camera.view.PreviewView
         android:id="@+id/previewView"
@@ -14,187 +14,135 @@
 
     <View
         android:layout_width="match_parent"
-        android:layout_height="150dp"
+        android:layout_height="132dp"
         android:layout_gravity="top"
-        android:background="#66000000" />
+        android:background="#26000000" />
 
     <com.example.treedirectiondemo.TreeOverlayView
         android:id="@+id/treeOverlay"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
+    <Button
+        android:id="@+id/btnMenu"
+        android:layout_width="44dp"
+        android:layout_height="44dp"
+        android:layout_gravity="top|start"
+        android:layout_marginStart="14dp"
+        android:layout_marginTop="18dp"
+        android:backgroundTint="#8E23322A"
+        android:minWidth="0dp"
+        android:minHeight="0dp"
+        android:padding="0dp"
+        android:text="☰"
+        android:textAllCaps="false"
+        android:textColor="#FFFFFF"
+        android:textSize="20sp" />
+
+    <Button
+        android:id="@+id/btnDebug"
+        android:layout_width="44dp"
+        android:layout_height="44dp"
+        android:layout_gravity="top|end"
+        android:layout_marginTop="18dp"
+        android:layout_marginEnd="14dp"
+        android:backgroundTint="#8E23322A"
+        android:minWidth="0dp"
+        android:minHeight="0dp"
+        android:padding="0dp"
+        android:text="⚙"
+        android:textAllCaps="false"
+        android:textColor="#FFFFFF"
+        android:textSize="19sp" />
+
     <LinearLayout
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|center_horizontal"
+        android:layout_marginTop="72dp"
+        android:orientation="horizontal">
+
+        <TextView
+            android:id="@+id/tvGpsStatus"
+            android:layout_width="122dp"
+            android:layout_height="44dp"
+            android:background="#D51A2921"
+            android:gravity="center"
+            android:text="GPS WAITING"
+            android:textColor="#FFFFFF"
+            android:textSize="12sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/tvCompassStatus"
+            android:layout_width="132dp"
+            android:layout_height="44dp"
+            android:layout_marginStart="10dp"
+            android:background="#D51A2921"
+            android:gravity="center"
+            android:text="HEADING WAITING"
+            android:textColor="#FFFFFF"
+            android:textSize="12sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/tvDirection"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_gravity="top"
-        android:orientation="vertical"
-        android:paddingStart="20dp"
-        android:paddingTop="18dp"
-        android:paddingEnd="20dp">
+        android:layout_gravity="bottom"
+        android:layout_marginStart="24dp"
+        android:layout_marginEnd="24dp"
+        android:layout_marginBottom="104dp"
+        android:gravity="center"
+        android:shadowColor="#CC000000"
+        android:shadowDx="0"
+        android:shadowDy="2"
+        android:shadowRadius="5"
+        android:text="Acquiring direction…"
+        android:textColor="#55E66F"
+        android:textSize="22sp"
+        android:textStyle="bold" />
 
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:gravity="center_vertical"
-            android:orientation="horizontal">
+    <Button
+        android:id="@+id/btnResetTree"
+        android:layout_width="match_parent"
+        android:layout_height="56dp"
+        android:layout_gravity="bottom"
+        android:layout_marginStart="24dp"
+        android:layout_marginEnd="24dp"
+        android:layout_marginBottom="28dp"
+        android:backgroundTint="#E01C2923"
+        android:text="🌳  Place test tree 35 m ahead"
+        android:textAllCaps="false"
+        android:textColor="#FFFFFF"
+        android:textSize="15sp"
+        android:textStyle="bold" />
 
-            <LinearLayout
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:orientation="vertical">
+    <TextView
+        android:id="@+id/tvDistance"
+        android:layout_width="1dp"
+        android:layout_height="1dp"
+        android:visibility="invisible" />
 
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="TREE NAVIGATOR"
-                    android:textColor="#FFFFFF"
-                    android:textSize="20sp"
-                    android:textStyle="bold" />
-
-                <TextView
-                    android:id="@+id/tvCoordinates"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="3dp"
-                    android:maxLines="1"
-                    android:ellipsize="end"
-                    android:text="Waiting for a reliable fix…"
-                    android:textColor="#CFE0D4"
-                    android:textSize="12sp" />
-            </LinearLayout>
-
-            <Button
-                android:id="@+id/btnDebug"
-                android:layout_width="wrap_content"
-                android:layout_height="42dp"
-                android:minWidth="0dp"
-                android:paddingStart="14dp"
-                android:paddingEnd="14dp"
-                android:text="Details"
-                android:textAllCaps="false" />
-        </LinearLayout>
-
-        <LinearLayout
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:orientation="horizontal">
-
-            <TextView
-                android:id="@+id/tvGpsStatus"
-                android:layout_width="wrap_content"
-                android:layout_height="32dp"
-                android:background="#B21B2A21"
-                android:gravity="center"
-                android:paddingStart="12dp"
-                android:paddingEnd="12dp"
-                android:text="GPS  WAITING"
-                android:textColor="#FFFFFF"
-                android:textSize="12sp"
-                android:textStyle="bold" />
-
-            <TextView
-                android:id="@+id/tvCompassStatus"
-                android:layout_width="wrap_content"
-                android:layout_height="32dp"
-                android:layout_marginStart="8dp"
-                android:background="#B21B2A21"
-                android:gravity="center"
-                android:paddingStart="12dp"
-                android:paddingEnd="12dp"
-                android:text="HEADING  ACQUIRING"
-                android:textColor="#FFFFFF"
-                android:textSize="12sp"
-                android:textStyle="bold" />
-        </LinearLayout>
-    </LinearLayout>
+    <TextView
+        android:id="@+id/tvCoordinates"
+        android:layout_width="1dp"
+        android:layout_height="1dp"
+        android:visibility="invisible" />
 
     <TextView
         android:id="@+id/tvDebug"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_gravity="top"
-        android:layout_marginStart="20dp"
-        android:layout_marginTop="142dp"
-        android:layout_marginEnd="20dp"
-        android:background="#DC07100B"
+        android:layout_gravity="center"
+        android:layout_margin="20dp"
+        android:background="#F20B120E"
         android:fontFamily="monospace"
-        android:padding="14dp"
+        android:maxLines="18"
+        android:padding="18dp"
         android:textColor="#E9F5EC"
         android:textSize="11sp"
         android:visibility="gone" />
-
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_gravity="bottom"
-        android:background="#E607100B"
-        android:orientation="vertical"
-        android:paddingStart="20dp"
-        android:paddingTop="18dp"
-        android:paddingEnd="20dp"
-        android:paddingBottom="18dp">
-
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="TARGET"
-            android:textColor="#8FB89B"
-            android:textSize="11sp"
-            android:textStyle="bold" />
-
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:gravity="bottom"
-            android:orientation="horizontal">
-
-            <TextView
-                android:id="@+id/tvDistance"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:text="-- m"
-                android:textColor="#FFFFFF"
-                android:textSize="36sp"
-                android:textStyle="bold" />
-
-            <TextView
-                android:id="@+id/tvDirection"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginBottom="6dp"
-                android:text="Acquiring direction…"
-                android:textColor="#BCECC8"
-                android:textSize="16sp"
-                android:textStyle="bold" />
-        </LinearLayout>
-
-        <View
-            android:layout_width="match_parent"
-            android:layout_height="1dp"
-            android:layout_marginTop="14dp"
-            android:layout_marginBottom="14dp"
-            android:background="#334C6854" />
-
-        <Button
-            android:id="@+id/btnResetTree"
-            android:layout_width="match_parent"
-            android:layout_height="52dp"
-            android:text="Place new test tree 35 m ahead"
-            android:textAllCaps="false"
-            android:textSize="15sp"
-            android:textStyle="bold" />
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="10dp"
-            android:text="The target coordinate remains fixed. Walk past it and the direction will move behind you."
-            android:textColor="#9FB2A5"
-            android:textSize="12sp" />
-    </LinearLayout>
 
 </FrameLayout>
