@@ -15,10 +15,9 @@ import kotlin.math.cos
 import kotlin.math.sin
 
 /**
- * Reference-driven UI renderer.
- * Design coordinates are taken from the original 265 x 580 phone panel in the approved mockup.
- * This keeps the visual hierarchy stable across Android screen sizes while ARCore supplies the
- * live camera underneath this View.
+ * Reference-driven UI renderer based on the approved 259 x 580 camera panel.
+ * The UI never invents a target projection: the tree pin is drawn only when ARCore supplies
+ * real screen coordinates for the world anchor.
  */
 class TreeNavigatorUiView @JvmOverloads constructor(
     context: Context,
@@ -26,6 +25,7 @@ class TreeNavigatorUiView @JvmOverloads constructor(
 ) : View(context, attrs) {
 
     enum class Screen { HOME, CREATE, SETTINGS, DIAGNOSTICS, CALIBRATION, GUIDE, ABOUT, MENU }
+
     enum class Action {
         OPEN_MENU, OPEN_SETTINGS, OPEN_CREATE, OPEN_DIAGNOSTICS, OPEN_CALIBRATION,
         OPEN_GUIDE, OPEN_ABOUT, GO_HOME, BACK, EXIT, CREATE_TARGET,
@@ -39,12 +39,16 @@ class TreeNavigatorUiView @JvmOverloads constructor(
         val headingQuality: String = "WAITING",
         val headingAccuracyDeg: Double = 99.0,
         val targetDistanceM: Double? = null,
+        val gpsDistanceM: Double? = null,
         val directionDeltaDeg: Double? = null,
         val targetScreenX: Float? = null,
         val targetScreenY: Float? = null,
         val targetInFront: Boolean = true,
         val targetReady: Boolean = false,
+        val targetRequested: Boolean = false,
         val arTracking: Boolean = false,
+        val arMovementM: Double? = null,
+        val arFailureReason: String = "NONE",
         val selectedDistanceM: Int = 35,
         val elevationOffsetM: Int = 0,
         val showDistance: Boolean = true,
@@ -67,23 +71,32 @@ class TreeNavigatorUiView @JvmOverloads constructor(
     )
 
     var onAction: ((Action) -> Unit)? = null
+
     var screen: Screen = Screen.HOME
-        set(value) { field = value; invalidate() }
+        set(value) {
+            field = value
+            invalidate()
+        }
+
     var model: Model = Model()
-        set(value) { field = value; invalidate() }
+        set(value) {
+            field = value
+            invalidate()
+        }
 
     private val p = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val W = 265f
+    private val W = 259f
     private val H = 580f
-    private val green = Color.rgb(76, 216, 58)
-    private val greenBright = Color.rgb(82, 235, 67)
-    private val orange = Color.rgb(255, 166, 0)
-    private val red = Color.rgb(255, 51, 51)
-    private val white = Color.rgb(248, 249, 248)
-    private val muted = Color.rgb(195, 205, 199)
+
+    private val green = Color.rgb(75, 218, 54)
+    private val orange = Color.rgb(255, 164, 0)
+    private val red = Color.rgb(255, 46, 46)
+    private val white = Color.rgb(248, 250, 248)
+    private val muted = Color.rgb(193, 202, 196)
     private val panel = Color.rgb(10, 16, 13)
     private val card = Color.rgb(18, 25, 21)
-    private val stroke = Color.rgb(45, 55, 49)
+    private val stroke = Color.rgb(46, 56, 50)
+    private val topChip = Color.argb(225, 27, 35, 31)
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
@@ -102,154 +115,183 @@ class TreeNavigatorUiView @JvmOverloads constructor(
         canvas.restore()
     }
 
-    // -------------------------------------------------------------------------
-    // HOME / CAMERA STATES
-    // -------------------------------------------------------------------------
+    // -----------------------------------------------------------------------------------------
+    // HOME / CAMERA
+    // -----------------------------------------------------------------------------------------
 
     private fun drawHome(c: Canvas) {
         drawTopBar(c)
+
         val gpsPoor = model.gpsAccuracy.isFinite() && model.gpsAccuracy >= 15f
         if (gpsPoor && !model.targetReady) {
             drawGpsPoorBody(c)
             return
         }
 
-        crosshair(c, 133f, 244f)
+        crosshair(c, 129.5f, 244f)
+
         val delta = model.directionDeltaDeg ?: 0.0
-        val behind = model.targetReady && (!model.targetInFront || abs(delta) >= 120.0)
+        val behind = model.targetReady && model.arTracking && !model.targetInFront
         val accent = when {
             behind -> red
             abs(delta) >= 22.0 -> orange
             else -> green
         }
 
-        if (model.targetReady) {
-            if (behind) {
-                drawTarget(c, 154f, 252f, red)
-            } else {
-                val tx = ((model.targetScreenX ?: 0.69f) * W).coerceIn(70f, 223f)
-                val ty = ((model.targetScreenY ?: 0.40f) * H).coerceIn(150f, 320f)
-                drawTarget(c, tx, ty, accent)
+        // Critical rule: no AR projection -> no tree marker. Never use a default screen position.
+        if (model.targetReady && model.arTracking && model.targetInFront) {
+            val sx = model.targetScreenX
+            val sy = model.targetScreenY
+            if (sx != null && sy != null && sx in 0f..1f && sy in 0f..1f) {
+                drawTarget(c, sx * W, sy * H, accent)
             }
+        } else if (model.targetRequested && !model.targetReady) {
+            drawLockingState(c)
         }
+
         drawCompass(c, delta, accent, behind)
         bottomCta(c)
     }
 
     private fun drawTopBar(c: Canvas) {
-        circleButton(c, 29f, 29f, "≡")
-        circleButton(c, 238f, 29f, "⚙")
-        statusChip(c, 28f, 58f, 103f, 95f, gps = true)
-        statusChip(c, 146f, 58f, 239f, 95f, gps = false)
+        circleButton(c, 27f, 27f)
+        drawMenuIcon(c, 27f, 27f)
+        circleButton(c, 241f, 27f)
+        drawGearIcon(c, 241f, 27f)
+        statusChip(c, 25f, 58f, 128f, 96f, gps = true)
+        statusChip(c, 142f, 58f, 249f, 96f, gps = false)
     }
 
     private fun statusChip(c: Canvas, l: Float, t: Float, r: Float, b: Float, gps: Boolean) {
-        roundRect(c, l, t, r, b, 8f, Color.argb(220, 16, 25, 21))
+        roundRect(c, l, t, r, b, 8f, topChip)
         val bad = if (gps) model.gpsAccuracy.isFinite() && model.gpsAccuracy >= 15f else model.headingQuality == "CALIBRATE"
         val accent = if (bad) orange else green
-        if (gps) pinIcon(c, l + 19f, (t + b) / 2f, accent, 9f)
-        else headingIcon(c, l + 19f, (t + b) / 2f, accent, 9f)
+        if (gps) drawGpsPin(c, l + 18f, (t + b) / 2f, accent, 8f)
+        else drawHeadingTarget(c, l + 18f, (t + b) / 2f, accent, 8f)
+
         val title = when {
             gps && bad -> "GPS POOR"
             gps -> "GPS GOOD"
             bad -> "HEADING"
             else -> "HEADING GOOD"
         }
-        text(c, title, l + 35f, t + 14f, 7.6f, white, false, Paint.Align.LEFT)
+        text(c, title, l + 34f, t + 14f, 7.4f, white, true, Paint.Align.LEFT)
+
         val value = if (gps) {
             if (model.gpsAccuracy.isFinite()) "±${String.format("%.1f", model.gpsAccuracy)} m" else "--"
-        } else if (bad) "CALIBRATE"
-        else "±${String.format("%.1f", model.headingAccuracyDeg)}°"
-        text(c, value, l + 35f, t + 29f, if (bad && !gps) 9.5f else 12.3f, accent, true, Paint.Align.LEFT)
+        } else if (bad) {
+            "CALIBRATE"
+        } else {
+            "±${String.format("%.1f", model.headingAccuracyDeg)}°"
+        }
+        text(c, value, l + 34f, t + 30f, if (!gps && bad) 9.2f else 13.0f, accent, true, Paint.Align.LEFT)
     }
 
     private fun drawTarget(c: Canvas, x: Float, y: Float, accent: Int) {
+        // The tree marker follows raw AR screen projection. It is not clamped into a "safe" area.
         p.style = Paint.Style.STROKE
-        p.strokeWidth = 2f
+        p.strokeWidth = 2.0f
         p.color = accent
-        c.drawOval(RectF(x - 31f, y + 15f, x + 31f, y + 27f), p)
-        p.style = Paint.Style.FILL
-        pinIcon(c, x, y - 7f, accent, 20f)
-        roundRect(c, x - 43f, y + 27f, x + 43f, y + 73f, 9f, Color.argb(207, 7, 12, 9))
-        text(c, "TARGET TREE", x, y + 45f, 8.3f, white, false)
-        if (model.showDistance) text(c, distanceText(), x, y + 65f, 19f, white, true)
+        c.drawOval(RectF(x - 30f, y + 15f, x + 30f, y + 27f), p)
+
+        drawTreePin(c, x, y - 7f, accent, 19f)
+
+        val cardTop = y + 27f
+        roundRect(c, x - 44f, cardTop, x + 44f, cardTop + 48f, 8f, Color.argb(205, 5, 10, 7))
+        text(c, "TARGET TREE", x, cardTop + 18f, 7.9f, white, true)
+        if (model.showDistance) {
+            text(c, distanceText(model.targetDistanceM), x, cardTop + 39f, 19f, white, true)
+        }
     }
 
-    /** Compass coordinates now match the original mockup: top arc ~396/580, labels ~477/580. */
+    private fun drawLockingState(c: Canvas) {
+        roundRect(c, 75f, 279f, 184f, 317f, 19f, Color.argb(205, 8, 13, 10))
+        drawHeadingTarget(c, 91f, 298f, green, 7f)
+        text(c, "LOCKING TARGET", 104f, 302f, 8.3f, white, true, Paint.Align.LEFT)
+    }
+
     private fun drawCompass(c: Canvas, delta: Double, accent: Int, behind: Boolean) {
-        val cx = 133f
+        val cx = 129.5f
         val cy = 507f
         val radius = 111f
 
         p.style = Paint.Style.FILL
-        p.color = Color.argb(145, 0, 6, 3)
+        p.color = Color.argb(145, 0, 7, 3)
         c.drawCircle(cx, cy, radius, p)
 
         p.style = Paint.Style.STROKE
         p.color = Color.WHITE
         p.strokeWidth = 1.4f
         c.drawArc(RectF(cx-radius, cy-radius, cx+radius, cy+radius), 200f, 140f, false, p)
+
         for (i in 0..28) {
-            val a = Math.toRadians(200.0 + i * 5.0)
+            val angle = Math.toRadians(200.0 + i * 5.0)
             val longTick = i % 5 == 0
             val r1 = radius - if (longTick) 12f else 7f
             p.strokeWidth = if (longTick) 2f else 1f
             c.drawLine(
-                cx + cos(a).toFloat() * r1, cy + sin(a).toFloat() * r1,
-                cx + cos(a).toFloat() * radius, cy + sin(a).toFloat() * radius, p
+                cx + cos(angle).toFloat() * r1,
+                cy + sin(angle).toFloat() * r1,
+                cx + cos(angle).toFloat() * radius,
+                cy + sin(angle).toFloat() * radius,
+                p
             )
         }
-        text(c, "W", 29f, 478f, 10f, white, true)
-        text(c, "E", 238f, 478f, 10f, white, true)
+
+        text(c, "W", 26f, 478f, 10f, white, true)
+        text(c, "E", 241f, 478f, 10f, white, true)
 
         val clamped = delta.coerceIn(-60.0, 60.0)
         val needleAngle = Math.toRadians(-90.0 + clamped * 0.68)
         val nx = cx + cos(needleAngle).toFloat() * 80f
         val ny = cy + sin(needleAngle).toFloat() * 80f
-        arrowHead(c, nx, ny, needleAngle, accent)
+        drawCompassNeedle(c, nx, ny, needleAngle, accent)
 
         if (model.showGuidance) {
             val label = when {
+                !model.targetReady && model.targetRequested -> "Locking AR target"
                 behind -> "Tree is behind you"
                 abs(delta) <= 3.0 -> "Tree is ahead"
                 delta < 0 -> "Turn left"
                 else -> "Turn right"
             }
-            text(c, label, cx, 478f, 11.7f, accent, true)
-            val degrees = if (behind) abs(delta).coerceAtMost(180.0).toInt() else abs(delta).toInt()
-            text(c, "${degrees}°", cx, 508f, 26f, accent, false)
+            text(c, label, cx, 478f, 11.5f, accent, true)
+            val degreeText = if (model.targetReady) "${abs(delta).coerceAtMost(180.0).toInt()}°" else "--"
+            text(c, degreeText, cx, 508f, 26f, accent, false)
         }
     }
 
     private fun bottomCta(c: Canvas) {
-        roundRect(c, 18f, 538f, 247f, 574f, 18f, Color.argb(238, 36, 43, 40))
-        treeIcon(c, 42f, 556f, green, 9f)
-        text(c, "Place test tree ${model.selectedDistanceM} m ahead", 139f, 560f, 10.5f, white, false)
+        roundRect(c, 15f, 538f, 244f, 574f, 18f, Color.argb(238, 37, 44, 41))
+        drawTreeIcon(c, 38f, 557f, green, 8f)
+        text(c, "Place test tree ${model.selectedDistanceM} m ahead", 133f, 561f, 10.2f, white, false)
     }
 
     private fun drawGpsPoorBody(c: Canvas) {
-        // A dark veil mimics the blurred/defocused warning state while keeping the live camera visible.
         p.style = Paint.Style.FILL
-        p.color = Color.argb(70, 0, 0, 0)
+        p.color = Color.argb(72, 0, 0, 0)
         c.drawRect(0f, 105f, W, H, p)
-        crosshair(c, 133f, 224f)
+        crosshair(c, 129.5f, 224f)
+
         p.color = Color.argb(55, 0, 0, 0)
-        c.drawCircle(133f, 263f, 54f, p)
+        c.drawCircle(129.5f, 263f, 54f, p)
         p.style = Paint.Style.STROKE
         p.strokeWidth = 2f
         p.color = orange
-        c.drawOval(RectF(106f, 249f, 160f, 277f), p)
-        text(c, "--", 133f, 267f, 13f, orange, true)
+        c.drawOval(RectF(102f, 249f, 157f, 277f), p)
+        text(c, "--", 129.5f, 267f, 13f, orange, true)
 
-        roundRect(c, 20f, 395f, 245f, 459f, 7f, Color.argb(230, 29, 27, 11))
-        p.style = Paint.Style.STROKE; p.strokeWidth = 1f; p.color = orange
-        c.drawRoundRect(RectF(20f,395f,245f,459f),7f,7f,p)
-        text(c, "⚠  GPS accuracy is limited", 31f, 416f, 9.5f, white, true, Paint.Align.LEFT)
-        text(c, "Move to an open area with a clearer view of the sky.", 31f, 438f, 8.0f, muted, false, Paint.Align.LEFT)
+        roundRect(c, 17f, 395f, 242f, 459f, 7f, Color.argb(230, 29, 27, 11))
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 1f
+        p.color = orange
+        c.drawRoundRect(RectF(17f, 395f, 242f, 459f), 7f, 7f, p)
+        drawWarningIcon(c, 31f, 414f, orange)
+        text(c, "GPS accuracy is limited", 44f, 417f, 9.3f, white, true, Paint.Align.LEFT)
+        text(c, "Move to an open area with a clearer view of the sky.", 29f, 439f, 7.8f, muted, false, Paint.Align.LEFT)
         bottomCta(c)
     }
 
-    /** Calibration is a camera state in the original mockup, not a black settings panel. */
     private fun drawCalibrationCamera(c: Canvas) {
         drawTopBar(c)
         p.style = Paint.Style.FILL
@@ -258,137 +300,152 @@ class TreeNavigatorUiView @JvmOverloads constructor(
 
         p.style = Paint.Style.STROKE
         p.strokeWidth = 3f
-        p.color = Color.rgb(73, 79, 75)
-        c.drawCircle(133f, 253f, 69f, p)
+        p.color = Color.rgb(74, 81, 76)
+        c.drawCircle(129.5f, 253f, 69f, p)
         p.color = green
-        c.drawArc(RectF(64f,184f,202f,322f), -90f, 105f, false, p)
-        phoneIcon(c, 133f, 253f, white)
+        c.drawArc(RectF(60.5f, 184f, 198.5f, 322f), -90f, 105f, false, p)
+        drawPhoneIcon(c, 129.5f, 253f, white)
 
-        text(c, "Move your phone in a figure-eight pattern", 133f, 391f, 10.3f, white, true)
-        text(c, "Keep the phone level and move slowly.", 133f, 415f, 8.5f, muted, false)
-        outlineButton(c, 18f, 538f, 247f, 574f, "CANCEL")
+        text(c, "Move your phone in a figure-eight pattern", 129.5f, 391f, 10.1f, white, true)
+        text(c, "Keep the phone level and move slowly.", 129.5f, 415f, 8.4f, muted, false)
+        outlineButton(c, 15f, 538f, 244f, 574f, "CANCEL")
     }
 
-    // -------------------------------------------------------------------------
-    // PANEL SCREENS
-    // -------------------------------------------------------------------------
+    // -----------------------------------------------------------------------------------------
+    // CREATE / OPTIONS / DETAILS
+    // -----------------------------------------------------------------------------------------
 
     private fun drawCreate(c: Canvas) {
         panelBackground(c)
         header(c, "Create test tree")
-        text(c, "Creates a target tree ${model.selectedDistanceM} metres away", 40f, 87f, 9.6f, muted, false, Paint.Align.LEFT)
-        text(c, "in the direction you are currently looking.", 40f, 104f, 9.6f, muted, false, Paint.Align.LEFT)
+        text(c, "Creates a target tree ${model.selectedDistanceM} meters away", 39f, 87f, 9.4f, muted, false, Paint.Align.LEFT)
+        text(c, "in the direction you are currently looking.", 39f, 104f, 9.4f, muted, false, Paint.Align.LEFT)
 
-        personIcon(c, 47f, 191f)
-        treeIcon(c, 215f, 185f, green, 20f)
-        p.style = Paint.Style.STROKE; p.strokeWidth = 1.2f; p.color = muted
-        c.drawLine(64f, 198f, 196f, 198f, p)
+        drawPersonIcon(c, 47f, 191f)
+        drawTreeIcon(c, 211f, 185f, green, 20f)
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 1.2f
+        p.color = muted
+        c.drawLine(64f, 198f, 193f, 198f, p)
         c.drawLine(64f, 194f, 64f, 202f, p)
-        c.drawLine(196f, 194f, 196f, 202f, p)
-        text(c, "${model.selectedDistanceM} m", 132f, 188f, 12f, white, true)
+        c.drawLine(193f, 194f, 193f, 202f, p)
+        text(c, "${model.selectedDistanceM} m", 129.5f, 188f, 12f, white, true)
 
-        row(c, 18f, 258f, 247f, 308f, "Distance", "${model.selectedDistanceM} m", true)
-        row(c, 18f, 309f, 247f, 359f, "Direction", "Current view", true)
-        row(c, 18f, 360f, 247f, 410f, "Elevation offset", "${model.elevationOffsetM} m", true)
-        primaryButton(c, 18f, 492f, 247f, 536f, "CREATE NOW")
+        row(c, 15f, 258f, 244f, 308f, "Distance", "${model.selectedDistanceM} m", true)
+        row(c, 15f, 309f, 244f, 359f, "Direction", "Current view", true)
+        row(c, 15f, 360f, 244f, 410f, "Elevation offset", "${model.elevationOffsetM} m", true)
+        primaryButton(c, 15f, 492f, 244f, 536f, "CREATE NOW")
     }
 
     private fun drawSettings(c: Canvas) {
         panelBackground(c)
         header(c, "Options")
+
         sectionLabel(c, "DISPLAY", 93f)
-        toggleRow(c, 18f, 104f, "Show distance", model.showDistance)
-        toggleRow(c, 18f, 142f, "Show direction guidance", model.showGuidance)
-        row(c, 18f, 180f, 247f, 218f, "Distance unit", "Metres (m)", true)
-        row(c, 18f, 218f, 247f, 256f, "Theme", "Dark", true)
+        toggleRow(c, 15f, 104f, "Show distance", model.showDistance)
+        toggleRow(c, 15f, 142f, "Show direction guidance", model.showGuidance)
+        row(c, 15f, 180f, 244f, 218f, "Distance unit", "Meters (m)", true)
+        row(c, 15f, 218f, 244f, 256f, "Theme", "Dark", true)
 
         sectionLabel(c, "FILTERING & STABILITY", 282f)
-        row(c, 18f, 293f, 247f, 334f, "Heading smoothing", model.headingSmoothing, true)
-        row(c, 18f, 334f, 247f, 375f, "GPS position smoothing", model.gpsSmoothing, true)
-        toggleRow(c, 18f, 375f, "Magnetic declination", model.declinationEnabled)
+        row(c, 15f, 293f, 244f, 334f, "Heading smoothing", model.headingSmoothing, true)
+        row(c, 15f, 334f, 244f, 375f, "GPS position smoothing", model.gpsSmoothing, true)
+        toggleRow(c, 15f, 375f, "Magnetic declination", model.declinationEnabled)
 
         sectionLabel(c, "OTHER", 429f)
-        row(c, 18f, 441f, 247f, 479f, "Calibrate compass", "", true)
-        row(c, 18f, 479f, 247f, 517f, "User guide", "", true)
-        row(c, 18f, 517f, 247f, 555f, "About", "", true)
+        row(c, 15f, 441f, 244f, 479f, "Calibrate compass", "", true)
+        row(c, 15f, 479f, 244f, 517f, "User guide", "", true)
+        row(c, 15f, 517f, 244f, 555f, "About", "", true)
     }
 
     private fun drawDiagnostics(c: Canvas) {
         panelBackground(c)
         header(c, "Details (Diagnostic)")
 
-        var y = 76f
-        diagnosticRow(c, y, "Game yaw (°)", fmt(model.gameYaw)); y += 29f
-        diagnosticRow(c, y, "Compass heading (°)", fmt(model.magneticHeading)); y += 29f
-        diagnosticRow(c, y, "True heading (°)", fmt(model.trueHeading)); y += 29f
-        diagnosticRow(c, y, "Filtered heading (°)", fmt(model.filteredHeading)); y += 29f
-        diagnosticRow(c, y, "Turn speed (°/s)", String.format("%.1f", model.turnSpeed)); y += 36f
+        var y = 72f
+        diagnosticRow(c, y, "AR status", model.arStatus); y += 26f
+        diagnosticRow(c, y, "AR distance (m)", fmt(model.targetDistanceM)); y += 26f
+        diagnosticRow(c, y, "AR movement since lock (m)", fmt(model.arMovementM)); y += 26f
+        diagnosticRow(c, y, "AR projected on screen", if (model.targetScreenX != null && model.targetScreenY != null) "YES" else "NO"); y += 26f
+        diagnosticRow(c, y, "AR failure reason", model.arFailureReason); y += 34f
 
-        diagnosticRow(c, y, "Bearing to tree (°)", fmt(model.gpsBearing)); y += 29f
-        diagnosticRow(c, y, "AR direction delta (°)", model.directionDeltaDeg?.let { String.format("%.1f", it) } ?: "--"); y += 29f
-        diagnosticRow(c, y, "Distance (m)", model.targetDistanceM?.let { String.format("%.1f", it) } ?: "--"); y += 36f
+        diagnosticRow(c, y, "GPS distance (m)", fmt(model.gpsDistanceM)); y += 26f
+        diagnosticRow(c, y, "GPS quality", "${model.gpsQuality} ${accuracyText()}"); y += 26f
+        diagnosticRow(c, y, "GPS bearing (°)", fmt(model.gpsBearing)); y += 26f
+        diagnosticRow(c, y, "Filtered bearing (°)", fmt(model.filteredBearing)); y += 34f
 
-        diagnosticRow(c, y, "GPS quality", "${model.gpsQuality} (${accuracyText()})"); y += 40f
-        diagnosticRow(c, y, "AR tracking", model.arStatus); y += 40f
-        diagnosticTwoLine(c, y, "Your position", coord(model.phoneLat, model.phoneLng)); y += 49f
+        diagnosticRow(c, y, "True heading (°)", fmt(model.trueHeading)); y += 26f
+        diagnosticRow(c, y, "Filtered heading (°)", fmt(model.filteredHeading)); y += 26f
+        diagnosticRow(c, y, "Turn speed (°/s)", String.format("%.1f", model.turnSpeed)); y += 34f
+
+        diagnosticTwoLine(c, y, "Your position", coord(model.phoneLat, model.phoneLng)); y += 45f
         diagnosticTwoLine(c, y, "Target tree (fixed)", coord(model.treeLat, model.treeLng))
-        outlineButton(c, 18f, 538f, 247f, 574f, "CALIBRATE COMPASS", green)
+        outlineButton(c, 15f, 538f, 244f, 574f, "CALIBRATE COMPASS", green)
     }
 
     private fun drawMenu(c: Canvas) {
         panelBackground(c)
-        treeIcon(c, 29f, 58f, green, 10f)
-        text(c, "TREE NAVIGATOR", 48f, 62f, 14f, white, true, Paint.Align.LEFT)
-        menuItem(c, 87f, "⌂", "Home", true)
-        menuItem(c, 126f, "▣", "Details", false)
-        menuItem(c, 165f, "♧", "Create test tree", false)
-        menuItem(c, 204f, "⚙", "Options", false)
-        menuItem(c, 243f, "◎", "Calibrate compass", false)
-        menuItem(c, 282f, "▤", "User guide", false)
-        menuItem(c, 321f, "ⓘ", "About", false)
-        p.style = Paint.Style.STROKE; p.color = stroke; p.strokeWidth = 1f
-        c.drawLine(17f, 514f, 248f, 514f, p)
-        text(c, "↪", 31f, 551f, 17f, red, true)
-        text(c, "Exit", 53f, 551f, 12f, red, false, Paint.Align.LEFT)
+        drawTreeIcon(c, 28f, 58f, green, 9f)
+        text(c, "TREE NAVIGATOR", 47f, 62f, 14f, white, true, Paint.Align.LEFT)
+
+        menuItem(c, 87f, "home", "Home", true)
+        menuItem(c, 126f, "details", "Details", false)
+        menuItem(c, 165f, "tree", "Create test tree", false)
+        menuItem(c, 204f, "settings", "Options", false)
+        menuItem(c, 243f, "compass", "Calibrate compass", false)
+        menuItem(c, 282f, "guide", "User guide", false)
+        menuItem(c, 321f, "info", "About", false)
+
+        p.style = Paint.Style.STROKE
+        p.color = stroke
+        p.strokeWidth = 1f
+        c.drawLine(15f, 514f, 244f, 514f, p)
+        drawExitIcon(c, 28f, 548f, red)
+        text(c, "Exit", 50f, 552f, 12f, red, false, Paint.Align.LEFT)
     }
 
     private fun drawGuide(c: Canvas) {
-        panelBackground(c); header(c, "User guide")
+        panelBackground(c)
+        header(c, "User guide")
         guideStep(c, "1", "Wait until GPS and heading show GOOD.", 104f)
         guideStep(c, "2", "Point the camera in the target direction.", 168f)
         guideStep(c, "3", "Create a target. ARCore locks it in world space.", 232f)
         guideStep(c, "4", "Walk past it, then turn around to find it again.", 296f)
-        roundRect(c, 18f, 365f, 247f, 447f, 8f, card)
-        text(c, "Tip", 31f, 389f, 11f, green, true, Paint.Align.LEFT)
-        text(c, "Once world-locked, GPS updates do not move the marker.", 31f, 414f, 8.6f, muted, false, Paint.Align.LEFT)
-        text(c, "GPS remains a global reference and recovery signal.", 31f, 432f, 8.6f, muted, false, Paint.Align.LEFT)
-        outlineButton(c, 18f, 538f, 247f, 574f, "DONE")
+
+        roundRect(c, 15f, 365f, 244f, 447f, 8f, card)
+        text(c, "Tip", 28f, 389f, 11f, green, true, Paint.Align.LEFT)
+        text(c, "Once world-locked, GPS does not move the marker.", 28f, 414f, 8.4f, muted, false, Paint.Align.LEFT)
+        text(c, "GPS remains a global reference and recovery signal.", 28f, 432f, 8.4f, muted, false, Paint.Align.LEFT)
+        outlineButton(c, 15f, 538f, 244f, 574f, "DONE")
     }
 
     private fun drawAbout(c: Canvas) {
-        panelBackground(c); header(c, "About")
-        treeIcon(c, 133f, 148f, green, 30f)
-        text(c, "TREE NAVIGATOR", 133f, 201f, 21f, white, true)
-        text(c, "AR navigation for fixed tree targets", 133f, 226f, 10f, muted, false)
-        roundRect(c, 18f, 270f, 247f, 396f, 8f, card)
-        text(c, "Tracking", 31f, 296f, 10f, muted, false, Paint.Align.LEFT)
-        text(c, "ARCore visual-inertial world anchor", 31f, 316f, 10f, white, true, Paint.Align.LEFT)
-        text(c, "Global reference", 31f, 347f, 10f, muted, false, Paint.Align.LEFT)
-        text(c, "GPS + true-north compass", 31f, 367f, 10f, white, true, Paint.Align.LEFT)
-        outlineButton(c, 18f, 538f, 247f, 574f, "DONE")
+        panelBackground(c)
+        header(c, "About")
+        drawTreeIcon(c, 129.5f, 148f, green, 30f)
+        text(c, "TREE NAVIGATOR", 129.5f, 201f, 21f, white, true)
+        text(c, "AR navigation for fixed tree targets", 129.5f, 226f, 10f, muted, false)
+
+        roundRect(c, 15f, 270f, 244f, 396f, 8f, card)
+        text(c, "Tracking", 28f, 296f, 10f, muted, false, Paint.Align.LEFT)
+        text(c, "ARCore visual-inertial world anchor", 28f, 316f, 10f, white, true, Paint.Align.LEFT)
+        text(c, "Global reference", 28f, 347f, 10f, muted, false, Paint.Align.LEFT)
+        text(c, "GPS + true-north compass", 28f, 367f, 10f, white, true, Paint.Align.LEFT)
+        outlineButton(c, 15f, 538f, 244f, 574f, "DONE")
     }
 
-    // -------------------------------------------------------------------------
-    // TOUCH MAP — same coordinate system as the design.
-    // -------------------------------------------------------------------------
+    // -----------------------------------------------------------------------------------------
+    // TOUCH MAP
+    // -----------------------------------------------------------------------------------------
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         if (event.action != MotionEvent.ACTION_UP) return true
         val x = event.x / width * W
         val y = event.y / height * H
+
         when (screen) {
             Screen.HOME -> when {
-                y < 55f && x < 65f -> fire(Action.OPEN_MENU)
+                y < 55f && x < 62f -> fire(Action.OPEN_MENU)
                 y < 55f && x > 205f -> fire(Action.OPEN_SETTINGS)
                 y > 525f -> fire(Action.OPEN_CREATE)
             }
@@ -414,7 +471,7 @@ class TreeNavigatorUiView @JvmOverloads constructor(
                 y > 525f -> fire(Action.OPEN_CALIBRATION)
             }
             Screen.CALIBRATION -> when {
-                y < 55f && x < 65f -> fire(Action.OPEN_MENU)
+                y < 55f && x < 62f -> fire(Action.OPEN_MENU)
                 y < 55f && x > 205f -> fire(Action.OPEN_SETTINGS)
                 y > 525f -> fire(Action.BACK)
             }
@@ -435,165 +492,355 @@ class TreeNavigatorUiView @JvmOverloads constructor(
 
     private fun fire(action: Action) = onAction?.invoke(action)
 
-    // -------------------------------------------------------------------------
+    // -----------------------------------------------------------------------------------------
     // COMPONENTS
-    // -------------------------------------------------------------------------
+    // -----------------------------------------------------------------------------------------
 
     private fun panelBackground(c: Canvas) {
-        p.style = Paint.Style.FILL; p.color = panel; c.drawRect(0f, 0f, W, H, p)
-        p.style = Paint.Style.STROKE; p.strokeWidth = 1f; p.color = stroke
+        p.style = Paint.Style.FILL
+        p.color = panel
+        c.drawRect(0f, 0f, W, H, p)
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 1f
+        p.color = stroke
         c.drawRoundRect(RectF(5f, 7f, W - 5f, H - 7f), 18f, 18f, p)
     }
 
     private fun header(c: Canvas, title: String) {
-        text(c, "‹", 27f, 37f, 25f, white, false)
-        text(c, title, 58f, 37f, 13f, white, true, Paint.Align.LEFT)
+        drawBackIcon(c, 25f, 32f, white)
+        text(c, title, 57f, 37f, 13f, white, true, Paint.Align.LEFT)
     }
 
     private fun row(c: Canvas, l: Float, t: Float, r: Float, b: Float, label: String, value: String, chevron: Boolean) {
         roundRect(c, l, t, r, b, 5f, Color.argb(132, 20, 27, 23))
-        p.style = Paint.Style.STROKE; p.strokeWidth = 1f; p.color = stroke
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 1f
+        p.color = stroke
         c.drawRoundRect(RectF(l, t, r, b), 5f, 5f, p)
-        text(c, label, l + 12f, (t + b) / 2f + 4f, 10.2f, white, false, Paint.Align.LEFT)
-        if (value.isNotBlank()) text(c, value, r - 18f, (t + b) / 2f + 4f, 9.8f, white, false, Paint.Align.RIGHT)
-        if (chevron) text(c, "›", r - 9f, (t + b) / 2f + 5f, 16f, muted, false)
+        text(c, label, l + 12f, (t + b) / 2f + 4f, 10.0f, white, false, Paint.Align.LEFT)
+        if (value.isNotBlank()) text(c, value, r - 18f, (t + b) / 2f + 4f, 9.6f, white, false, Paint.Align.RIGHT)
+        if (chevron) drawChevron(c, r - 9f, (t + b) / 2f, muted)
     }
 
     private fun toggleRow(c: Canvas, l: Float, t: Float, label: String, enabled: Boolean) {
-        row(c, l, t, 247f, t + 38f, label, "", false)
-        val x = 224f; val y = t + 19f
+        row(c, l, t, 244f, t + 38f, label, "", false)
+        val x = 221f
+        val y = t + 19f
         roundRect(c, x - 15f, y - 8f, x + 15f, y + 8f, 8f, if (enabled) Color.rgb(39, 169, 48) else Color.rgb(65, 70, 67))
-        p.style = Paint.Style.FILL; p.color = white
+        p.style = Paint.Style.FILL
+        p.color = white
         c.drawCircle(if (enabled) x + 7f else x - 7f, y, 6f, p)
     }
 
     private fun diagnosticRow(c: Canvas, y: Float, label: String, value: String) {
-        text(c, label, 22f, y + 10f, 8.9f, white, false, Paint.Align.LEFT)
-        text(c, value, 242f, y + 10f, 9.4f, green, true, Paint.Align.RIGHT)
-        p.style = Paint.Style.STROKE; p.strokeWidth = .7f; p.color = Color.rgb(39, 47, 43)
-        c.drawLine(18f, y + 19f, 247f, y + 19f, p)
+        text(c, label, 19f, y + 10f, 8.5f, white, false, Paint.Align.LEFT)
+        text(c, value, 240f, y + 10f, 8.9f, green, true, Paint.Align.RIGHT)
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = .7f
+        p.color = Color.rgb(39, 47, 43)
+        c.drawLine(15f, y + 18f, 244f, y + 18f, p)
     }
 
     private fun diagnosticTwoLine(c: Canvas, y: Float, label: String, value: String) {
-        roundRect(c, 18f, y, 247f, y + 43f, 6f, Color.argb(108, 20, 27, 23))
-        text(c, label, 27f, y + 18f, 8.8f, white, false, Paint.Align.LEFT)
-        text(c, value, 238f, y + 18f, 8.8f, white, false, Paint.Align.RIGHT)
+        roundRect(c, 15f, y, 244f, y + 42f, 6f, Color.argb(108, 20, 27, 23))
+        text(c, label, 24f, y + 18f, 8.7f, white, false, Paint.Align.LEFT)
+        text(c, value, 237f, y + 18f, 8.5f, white, false, Paint.Align.RIGHT)
     }
 
     private fun guideStep(c: Canvas, number: String, body: String, y: Float) {
-        text(c, number, 34f, y + 8f, 23f, green, true)
-        text(c, body, 60f, y + 3f, 9.3f, white, true, Paint.Align.LEFT)
+        text(c, number, 31f, y + 8f, 23f, green, true)
+        text(c, body, 57f, y + 3f, 9.1f, white, true, Paint.Align.LEFT)
     }
 
     private fun menuItem(c: Canvas, y: Float, icon: String, label: String, selected: Boolean) {
-        if (selected) roundRect(c, 17f, y - 18f, 248f, y + 13f, 5f, Color.rgb(29, 39, 34))
-        text(c, icon, 31f, y + 3f, 15f, white, true)
-        text(c, label, 53f, y + 3f, 11.5f, if (selected) green else white, false, Paint.Align.LEFT)
+        if (selected) roundRect(c, 15f, y - 18f, 244f, y + 13f, 5f, Color.rgb(29, 39, 34))
+        drawMenuRowIcon(c, icon, 28f, y - 1f, if (selected) white else muted)
+        text(c, label, 50f, y + 3f, 11.4f, if (selected) green else white, false, Paint.Align.LEFT)
     }
 
-    private fun sectionLabel(c: Canvas, s: String, y: Float) = text(c, s, 18f, y, 8.5f, muted, false, Paint.Align.LEFT)
+    private fun sectionLabel(c: Canvas, value: String, y: Float) =
+        text(c, value, 15f, y, 8.4f, muted, false, Paint.Align.LEFT)
 
     private fun primaryButton(c: Canvas, l: Float, t: Float, r: Float, b: Float, label: String) {
-        roundRect(c, l, t, r, b, 5f, Color.rgb(47, 174, 49))
+        roundRect(c, l, t, r, b, 5f, Color.rgb(48, 175, 49))
         text(c, label, (l + r) / 2f, (t + b) / 2f + 5f, 12f, white, true)
     }
 
     private fun outlineButton(c: Canvas, l: Float, t: Float, r: Float, b: Float, label: String, color: Int = white) {
-        p.style = Paint.Style.STROKE; p.strokeWidth = 1.2f; p.color = stroke
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 1.2f
+        p.color = stroke
         c.drawRoundRect(RectF(l, t, r, b), 5f, 5f, p)
-        text(c, label, (l + r) / 2f, (t + b) / 2f + 4f, 10.5f, color, true)
+        text(c, label, (l + r) / 2f, (t + b) / 2f + 4f, 10.4f, color, true)
     }
 
-    private fun circleButton(c: Canvas, x: Float, y: Float, label: String) {
-        p.style = Paint.Style.FILL; p.color = Color.argb(155, 63, 78, 71)
+    private fun circleButton(c: Canvas, x: Float, y: Float) {
+        p.style = Paint.Style.FILL
+        p.color = Color.argb(165, 93, 112, 104)
         c.drawCircle(x, y, 12f, p)
-        text(c, label, x, y + 4f, 14f, white, false)
     }
 
-    private fun crosshair(c: Canvas, x: Float, y: Float) {
-        p.style = Paint.Style.STROKE; p.strokeWidth = 1.5f; p.color = white
-        c.drawLine(x - 12f, y, x + 12f, y, p)
-        c.drawLine(x, y - 12f, x, y + 12f, p)
+    // -----------------------------------------------------------------------------------------
+    // VECTOR ICONS — no device-dependent emoji for production controls.
+    // -----------------------------------------------------------------------------------------
+
+    private fun drawMenuIcon(c: Canvas, x: Float, y: Float) {
+        p.style = Paint.Style.STROKE
+        p.strokeCap = Paint.Cap.ROUND
+        p.strokeWidth = 1.6f
+        p.color = white
+        c.drawLine(x - 5f, y - 4f, x + 5f, y - 4f, p)
+        c.drawLine(x - 5f, y, x + 5f, y, p)
+        c.drawLine(x - 5f, y + 4f, x + 5f, y + 4f, p)
+        p.strokeCap = Paint.Cap.BUTT
     }
 
-    private fun treeIcon(c: Canvas, x: Float, y: Float, color: Int, size: Float) {
-        p.style = Paint.Style.FILL; p.color = color
-        c.drawCircle(x - size * .35f, y - size * .20f, size * .45f, p)
-        c.drawCircle(x + size * .25f, y - size * .25f, size * .48f, p)
-        c.drawCircle(x, y - size * .55f, size * .50f, p)
-        p.color = Color.rgb(75, 88, 39)
-        c.drawRect(x - size * .12f, y - size * .05f, x + size * .12f, y + size * .65f, p)
+    private fun drawGearIcon(c: Canvas, x: Float, y: Float) {
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 1.7f
+        p.color = white
+        c.drawCircle(x, y, 4f, p)
+        c.drawCircle(x, y, 7f, p)
+        for (i in 0 until 8) {
+            val a = i * Math.PI / 4.0
+            c.drawLine(
+                x + cos(a).toFloat() * 7f,
+                y + sin(a).toFloat() * 7f,
+                x + cos(a).toFloat() * 9f,
+                y + sin(a).toFloat() * 9f,
+                p
+            )
+        }
     }
 
-    private fun personIcon(c: Canvas, x: Float, y: Float) {
-        p.style = Paint.Style.FILL; p.color = Color.rgb(151, 164, 159)
-        c.drawCircle(x, y - 16f, 5f, p)
-        c.drawRoundRect(RectF(x - 5f, y - 10f, x + 5f, y + 10f), 4f, 4f, p)
-        p.strokeWidth = 4f; p.style = Paint.Style.STROKE
-        c.drawLine(x - 3f, y + 8f, x - 7f, y + 23f, p)
-        c.drawLine(x + 3f, y + 8f, x + 7f, y + 23f, p)
+    private fun drawGpsPin(c: Canvas, x: Float, y: Float, color: Int, size: Float) {
+        p.style = Paint.Style.FILL
+        p.color = color
+        val path = Path().apply {
+            moveTo(x, y + size)
+            cubicTo(x - size * .8f, y + size * .2f, x - size * .72f, y - size * .72f, x, y - size)
+            cubicTo(x + size * .72f, y - size * .72f, x + size * .8f, y + size * .2f, x, y + size)
+            close()
+        }
+        c.drawPath(path, p)
+        p.color = Color.rgb(18, 79, 23)
+        c.drawCircle(x, y - size * .25f, size * .28f, p)
     }
 
-    private fun phoneIcon(c: Canvas, x: Float, y: Float, color: Int) {
-        p.style = Paint.Style.STROKE; p.strokeWidth = 3f; p.color = color
+    private fun drawHeadingTarget(c: Canvas, x: Float, y: Float, color: Int, size: Float) {
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 1.8f
+        p.color = color
+        c.drawCircle(x, y, size * .68f, p)
+        c.drawLine(x - size, y, x + size, y, p)
+        c.drawLine(x, y - size, x, y + size, p)
+        p.style = Paint.Style.FILL
+        c.drawCircle(x, y, size * .18f, p)
+    }
+
+    private fun drawTreePin(c: Canvas, x: Float, y: Float, color: Int, size: Float) {
+        p.style = Paint.Style.FILL
+        p.color = color
+        val path = Path().apply {
+            moveTo(x, y + size)
+            cubicTo(x - size * .82f, y + size * .1f, x - size * .78f, y - size * .75f, x, y - size)
+            cubicTo(x + size * .78f, y - size * .75f, x + size * .82f, y + size * .1f, x, y + size)
+            close()
+        }
+        c.drawPath(path, p)
+        p.color = Color.rgb(18, 54, 23)
+        c.drawCircle(x, y - size * .27f, size * .38f, p)
+        drawTreeIcon(c, x, y - size * .18f, color, size * .27f)
+    }
+
+    private fun drawTreeIcon(c: Canvas, x: Float, y: Float, color: Int, size: Float) {
+        p.style = Paint.Style.FILL
+        p.color = color
+        c.drawCircle(x - size * .34f, y - size * .18f, size * .45f, p)
+        c.drawCircle(x + size * .28f, y - size * .22f, size * .48f, p)
+        c.drawCircle(x, y - size * .55f, size * .52f, p)
+        p.color = Color.rgb(78, 93, 38)
+        c.drawRect(x - size * .12f, y - size * .03f, x + size * .12f, y + size * .68f, p)
+    }
+
+    private fun drawCompassNeedle(c: Canvas, x: Float, y: Float, angle: Double, color: Int) {
+        p.style = Paint.Style.FILL
+        p.color = color
+        val ux = cos(angle).toFloat()
+        val uy = sin(angle).toFloat()
+        val px = -uy
+        val py = ux
+        val path = Path().apply {
+            moveTo(x + ux * 13f, y + uy * 13f)
+            lineTo(x - ux * 9f + px * 5f, y - uy * 9f + py * 5f)
+            lineTo(x - ux * 5f, y - uy * 5f)
+            lineTo(x - ux * 9f - px * 5f, y - uy * 9f - py * 5f)
+            close()
+        }
+        c.drawPath(path, p)
+    }
+
+    private fun drawPhoneIcon(c: Canvas, x: Float, y: Float, color: Int) {
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 3f
+        p.color = color
         c.drawRoundRect(RectF(x - 18f, y - 31f, x + 18f, y + 31f), 4f, 4f, p)
         p.style = Paint.Style.FILL
         c.drawCircle(x, y + 25f, 2f, p)
     }
 
-    private fun pinIcon(c: Canvas, x: Float, y: Float, color: Int, size: Float) {
-        p.style = Paint.Style.FILL; p.color = color
+    private fun drawPersonIcon(c: Canvas, x: Float, y: Float) {
+        p.style = Paint.Style.FILL
+        p.color = Color.rgb(151, 164, 159)
+        c.drawCircle(x, y - 16f, 5f, p)
+        c.drawRoundRect(RectF(x - 5f, y - 10f, x + 5f, y + 10f), 4f, 4f, p)
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 4f
+        c.drawLine(x - 3f, y + 8f, x - 7f, y + 23f, p)
+        c.drawLine(x + 3f, y + 8f, x + 7f, y + 23f, p)
+    }
+
+    private fun drawWarningIcon(c: Canvas, x: Float, y: Float, color: Int) {
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 1.7f
+        p.color = color
         val path = Path().apply {
-            moveTo(x, y + size)
-            cubicTo(x - size * .85f, y + size * .1f, x - size * .75f, y - size * .8f, x, y - size)
-            cubicTo(x + size * .75f, y - size * .8f, x + size * .85f, y + size * .1f, x, y + size)
+            moveTo(x, y - 7f)
+            lineTo(x - 7f, y + 6f)
+            lineTo(x + 7f, y + 6f)
             close()
         }
         c.drawPath(path, p)
-        p.color = Color.rgb(12, 35, 18)
-        c.drawCircle(x, y - size * .28f, size * .30f, p)
-        treeIcon(c, x, y - size * .28f, color, size * .18f)
+        p.style = Paint.Style.FILL
+        c.drawRect(x - 0.8f, y - 2f, x + 0.8f, y + 2f, p)
+        c.drawCircle(x, y + 4f, 1f, p)
     }
 
-    private fun headingIcon(c: Canvas, x: Float, y: Float, color: Int, size: Float) {
-        p.style = Paint.Style.STROKE; p.strokeWidth = 2f; p.color = color
-        c.drawCircle(x, y, size * .65f, p)
-        c.drawLine(x - size * .9f, y, x + size * .9f, y, p)
-        c.drawLine(x, y - size * .9f, x, y + size * .9f, p)
+    private fun drawBackIcon(c: Canvas, x: Float, y: Float, color: Int) {
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 1.5f
+        p.strokeCap = Paint.Cap.ROUND
+        p.color = color
+        c.drawLine(x + 5f, y, x - 5f, y, p)
+        c.drawLine(x - 5f, y, x, y - 5f, p)
+        c.drawLine(x - 5f, y, x, y + 5f, p)
+        p.strokeCap = Paint.Cap.BUTT
     }
 
-    private fun arrowHead(c: Canvas, x: Float, y: Float, angle: Double, color: Int) {
-        p.style = Paint.Style.FILL; p.color = color
-        val ux = cos(angle).toFloat(); val uy = sin(angle).toFloat()
-        val px = -uy; val py = ux
-        val path = Path().apply {
-            moveTo(x + ux * 12f, y + uy * 12f)
-            lineTo(x - ux * 8f + px * 6f, y - uy * 8f + py * 6f)
-            lineTo(x - ux * 8f - px * 6f, y - uy * 8f - py * 6f)
-            close()
+    private fun drawChevron(c: Canvas, x: Float, y: Float, color: Int) {
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 1.3f
+        p.color = color
+        c.drawLine(x - 2f, y - 4f, x + 2f, y, p)
+        c.drawLine(x + 2f, y, x - 2f, y + 4f, p)
+    }
+
+    private fun drawExitIcon(c: Canvas, x: Float, y: Float, color: Int) {
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 1.7f
+        p.color = color
+        c.drawRect(x - 6f, y - 6f, x + 1f, y + 6f, p)
+        c.drawLine(x, y, x + 8f, y, p)
+        c.drawLine(x + 8f, y, x + 4f, y - 4f, p)
+        c.drawLine(x + 8f, y, x + 4f, y + 4f, p)
+    }
+
+    private fun drawMenuRowIcon(c: Canvas, type: String, x: Float, y: Float, color: Int) {
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 1.5f
+        p.color = color
+        when (type) {
+            "home" -> {
+                val path = Path().apply {
+                    moveTo(x - 6f, y)
+                    lineTo(x, y - 6f)
+                    lineTo(x + 6f, y)
+                    lineTo(x + 5f, y + 7f)
+                    lineTo(x - 5f, y + 7f)
+                    close()
+                }
+                c.drawPath(path, p)
+            }
+            "details" -> {
+                c.drawRect(x - 5f, y - 7f, x + 5f, y + 7f, p)
+                c.drawLine(x - 2f, y - 3f, x + 3f, y - 3f, p)
+                c.drawLine(x - 2f, y + 1f, x + 3f, y + 1f, p)
+                c.drawLine(x - 2f, y + 5f, x + 3f, y + 5f, p)
+            }
+            "tree" -> drawTreeIcon(c, x, y + 3f, color, 7f)
+            "settings" -> drawGearIconAt(c, x, y, color)
+            "compass" -> drawHeadingTarget(c, x, y, color, 7f)
+            "guide" -> {
+                c.drawRect(x - 6f, y - 7f, x + 6f, y + 7f, p)
+                c.drawLine(x, y - 7f, x, y + 7f, p)
+            }
+            "info" -> {
+                c.drawCircle(x, y, 7f, p)
+                text(c, "i", x, y + 4f, 10f, color, true)
+            }
         }
-        c.drawPath(path, p)
+    }
+
+    private fun drawGearIconAt(c: Canvas, x: Float, y: Float, color: Int) {
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 1.5f
+        p.color = color
+        c.drawCircle(x, y, 3f, p)
+        c.drawCircle(x, y, 6f, p)
+        for (i in 0 until 8) {
+            val a = i * Math.PI / 4.0
+            c.drawLine(
+                x + cos(a).toFloat() * 6f,
+                y + sin(a).toFloat() * 6f,
+                x + cos(a).toFloat() * 8f,
+                y + sin(a).toFloat() * 8f,
+                p
+            )
+        }
+    }
+
+    private fun crosshair(c: Canvas, x: Float, y: Float) {
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 1.5f
+        p.color = white
+        c.drawLine(x - 12f, y, x + 12f, y, p)
+        c.drawLine(x, y - 12f, x, y + 12f, p)
     }
 
     private fun roundRect(c: Canvas, l: Float, t: Float, r: Float, b: Float, radius: Float, color: Int) {
-        p.style = Paint.Style.FILL; p.color = color
+        p.style = Paint.Style.FILL
+        p.color = color
         c.drawRoundRect(RectF(l, t, r, b), radius, radius, p)
     }
 
-    private fun text(c: Canvas, s: String, x: Float, y: Float, size: Float, color: Int, bold: Boolean = false, align: Paint.Align = Paint.Align.CENTER) {
+    private fun text(
+        c: Canvas,
+        value: String,
+        x: Float,
+        y: Float,
+        size: Float,
+        color: Int,
+        bold: Boolean = false,
+        align: Paint.Align = Paint.Align.CENTER
+    ) {
         p.style = Paint.Style.FILL
         p.color = color
         p.textSize = size
         p.textAlign = align
-        p.typeface = Typeface.create(Typeface.DEFAULT, if (bold) Typeface.BOLD else Typeface.NORMAL)
-        c.drawText(s, x, y, p)
+        p.typeface = Typeface.create("sans-serif", if (bold) Typeface.BOLD else Typeface.NORMAL)
+        c.drawText(value, x, y, p)
     }
 
-    private fun distanceText(): String = model.targetDistanceM?.let {
-        if (it < 10) String.format("%.1f m", it) else String.format("%.0f m", it)
+    private fun distanceText(value: Double?): String = value?.let {
+        if (it < 10.0) String.format("%.1f m", it) else String.format("%.0f m", it)
     } ?: "-- m"
 
-    private fun accuracyText(): String = if (model.gpsAccuracy.isFinite()) "±${String.format("%.1f", model.gpsAccuracy)} m" else "--"
-    private fun fmt(value: Double?): String = value?.let { String.format("%.1f", it) } ?: "--"
-    private fun coord(lat: Double?, lng: Double?): String = if (lat != null && lng != null) String.format("%.6f  %.6f", lat, lng) else "--"
+    private fun accuracyText(): String = if (model.gpsAccuracy.isFinite()) {
+        "±${String.format("%.1f", model.gpsAccuracy)} m"
+    } else "--"
+
+    private fun fmt(value: Double?): String = value?.let { String.format("%.2f", it) } ?: "--"
+
+    private fun coord(lat: Double?, lng: Double?): String =
+        if (lat != null && lng != null) String.format("%.6f  %.6f", lat, lng) else "--"
 }
