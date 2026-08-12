@@ -12,10 +12,6 @@ import android.location.Location
 import android.os.Bundle
 import android.os.Looper
 import android.view.Surface
-import android.view.View
-import android.widget.Button
-import android.widget.Switch
-import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
@@ -33,276 +29,147 @@ import kotlin.math.abs
 import kotlin.math.asin
 import kotlin.math.atan2
 import kotlin.math.cos
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.sin
 
 class MainActivity : ComponentActivity(), SensorEventListener {
 
     private lateinit var arView: ArCoreCameraView
-    private lateinit var overlay: TreeOverlayView
-    private lateinit var tvGpsStatus: TextView
-    private lateinit var tvCompassStatus: TextView
-    private lateinit var tvDirection: TextView
-    private lateinit var gpsWarning: View
-
-    private lateinit var panelMenu: View
-    private lateinit var panelCreate: View
-    private lateinit var panelSettings: View
-    private lateinit var panelDiagnostics: View
-    private lateinit var panelCalibration: View
-    private lateinit var panelGuide: View
-    private lateinit var panelAbout: View
-    private val panels = mutableListOf<View>()
-
-    private lateinit var tvCreateDistance: TextView
-    private lateinit var tvCreateDistanceHero: TextView
-    private lateinit var tvDiagnostics: TextView
-    private lateinit var tvCalibrationHeading: TextView
-    private lateinit var swDistance: Switch
-    private lateinit var swGuidance: Switch
-    private lateinit var swTrueNorth: Switch
-    private lateinit var swStability: Switch
-
+    private lateinit var uiView: TreeNavigatorUiView
     private val sensorManager by lazy { getSystemService(SENSOR_SERVICE) as SensorManager }
     private val fusedLocation by lazy { LocationServices.getFusedLocationProviderClient(this) }
 
     private var arSession: Session? = null
+    private var arRunning = false
     private var installRequested = false
-    private var arFrameState: ArCoreCameraView.FrameState? = null
-    private var arCoreStatus = "STARTING"
+    private var arFrame = ArCoreCameraView.FrameState(false,false,null,null,false,null,null,null,TrackingState.PAUSED)
 
-    private var currentLocation: Location? = null
+    private var rawLocation: Location? = null
+    private var filteredLocation: Location? = null
     private var gpsAccuracy = Float.MAX_VALUE
-    private var locationQuality = "WAITING"
+    private var gpsBearing: Double? = null
+    private var filteredBearing: Double? = null
 
     private var magneticHeading: Double? = null
     private var trueHeading: Double? = null
-    private var headingAccuracy = SensorManager.SENSOR_STATUS_UNRELIABLE
-    private var lastHeadingSample: Double? = null
-    private var headingStabilityEstimate = 4.0
+    private var filteredHeading: Double? = null
+    private var gameYaw: Double? = null
+    private var turnSpeed = 0.0
+    private var headingStability = 2.0
+    private var sensorAccuracy = SensorManager.SENSOR_STATUS_ACCURACY_MEDIUM
+    private var previousGameYaw: Double? = null
+    private var previousGameTimestamp = 0L
 
     private var treeLat: Double? = null
     private var treeLng: Double? = null
-    private var gpsDistanceMeters: Float? = null
-    private var gpsBearing: Double? = null
-    private var directionDelta: Double? = null
-    private var autoTargetPlaced = false
-    private var createDistanceMeters = 35
+    private var selectedDistance = 35
+    private var elevationOffset = 0
+    private var autoTargetPending = true
 
     private var showDistance = true
     private var showGuidance = true
-    private var trueNorthCorrection = true
-    private var microStabilization = true
+    private var declinationEnabled = true
+    private var headingSmoothing = "Balanced"
+    private var gpsSmoothing = "High"
+    private var previousScreen = TreeNavigatorUiView.Screen.HOME
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
         if (hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)) startLocationUpdates()
-        if (!hasPermission(Manifest.permission.CAMERA)) {
-            showToast("Camera permission is required for AR navigation")
-        } else {
-            resumeArCore()
-        }
+        if (hasPermission(Manifest.permission.CAMERA)) ensureArSession()
     }
 
     private val locationCallback = object : LocationCallback() {
         override fun onLocationResult(result: LocationResult) {
-            result.lastLocation?.let { location ->
-                currentLocation = Location(location)
-                gpsAccuracy = if (location.hasAccuracy()) location.accuracy else Float.MAX_VALUE
-                locationQuality = when {
-                    !location.hasAccuracy() -> "POOR"
-                    location.accuracy <= 4f -> "EXCELLENT"
-                    location.accuracy <= 8f -> "GOOD"
-                    location.accuracy <= 15f -> "FAIR"
-                    else -> "POOR"
-                }
-                recomputeGpsGeometry()
-                maybeAutoCreateTarget()
-                renderState()
-            }
+            result.lastLocation?.let(::acceptLocation)
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
-        bindViews()
-        bindActions()
-        bindArCoreFrames()
-        permissionLauncher.launch(
-            arrayOf(
-                Manifest.permission.CAMERA,
-                Manifest.permission.ACCESS_FINE_LOCATION,
-                Manifest.permission.ACCESS_COARSE_LOCATION
-            )
-        )
-    }
-
-    private fun bindViews() {
         arView = findViewById(R.id.arView)
-        overlay = findViewById(R.id.treeOverlay)
-        tvGpsStatus = findViewById(R.id.tvGpsStatus)
-        tvCompassStatus = findViewById(R.id.tvCompassStatus)
-        tvDirection = findViewById(R.id.tvDirection)
-        gpsWarning = findViewById(R.id.gpsWarning)
-
-        panelMenu = findViewById(R.id.panelMenu)
-        panelCreate = findViewById(R.id.panelCreate)
-        panelSettings = findViewById(R.id.panelSettings)
-        panelDiagnostics = findViewById(R.id.panelDiagnostics)
-        panelCalibration = findViewById(R.id.panelCalibration)
-        panelGuide = findViewById(R.id.panelGuide)
-        panelAbout = findViewById(R.id.panelAbout)
-        panels += listOf(panelMenu, panelCreate, panelSettings, panelDiagnostics, panelCalibration, panelGuide, panelAbout)
-
-        tvCreateDistance = findViewById(R.id.tvCreateDistance)
-        tvCreateDistanceHero = findViewById(R.id.tvCreateDistanceHero)
-        tvDiagnostics = findViewById(R.id.tvDiagnostics)
-        tvCalibrationHeading = findViewById(R.id.tvCalibrationHeading)
-        swDistance = findViewById(R.id.swDistance)
-        swGuidance = findViewById(R.id.swGuidance)
-        swTrueNorth = findViewById(R.id.swTrueNorth)
-        swStability = findViewById(R.id.swStability)
-    }
-
-    private fun bindActions() {
-        findViewById<Button>(R.id.btnMenu).setOnClickListener { showPanel(panelMenu) }
-        findViewById<Button>(R.id.btnSettings).setOnClickListener { showPanel(panelSettings) }
-        findViewById<Button>(R.id.btnResetTree).setOnClickListener {
-            createDistanceMeters = 35
-            updateCreateDistanceUi()
-            placeTarget(createDistanceMeters)
-        }
-
-        findViewById<Button>(R.id.btnMenuClose).setOnClickListener { showHome() }
-        findViewById<TextView>(R.id.menuHome).setOnClickListener { showHome() }
-        findViewById<TextView>(R.id.menuDiagnostics).setOnClickListener { showPanel(panelDiagnostics) }
-        findViewById<TextView>(R.id.menuCreate).setOnClickListener { showPanel(panelCreate) }
-        findViewById<TextView>(R.id.menuSettings).setOnClickListener { showPanel(panelSettings) }
-        findViewById<TextView>(R.id.menuCalibration).setOnClickListener { showPanel(panelCalibration) }
-        findViewById<TextView>(R.id.menuGuide).setOnClickListener { showPanel(panelGuide) }
-        findViewById<TextView>(R.id.menuAbout).setOnClickListener { showPanel(panelAbout) }
-        findViewById<TextView>(R.id.menuExit).setOnClickListener { finish() }
-
-        findViewById<Button>(R.id.btnCreateBack).setOnClickListener { showHome() }
-        findViewById<Button>(R.id.btnDistanceMinus).setOnClickListener {
-            createDistanceMeters = (createDistanceMeters - 5).coerceAtLeast(10)
-            updateCreateDistanceUi()
-        }
-        findViewById<Button>(R.id.btnDistancePlus).setOnClickListener {
-            createDistanceMeters = (createDistanceMeters + 5).coerceAtMost(100)
-            updateCreateDistanceUi()
-        }
-        findViewById<Button>(R.id.btnCreateNow).setOnClickListener {
-            placeTarget(createDistanceMeters)
-            showHome()
-        }
-
-        findViewById<Button>(R.id.btnSettingsBack).setOnClickListener { showHome() }
-        swDistance.setOnCheckedChangeListener { _, checked ->
-            showDistance = checked
-            renderState()
-        }
-        swGuidance.setOnCheckedChangeListener { _, checked ->
-            showGuidance = checked
-            renderState()
-        }
-        swTrueNorth.setOnCheckedChangeListener { _, checked ->
-            trueNorthCorrection = checked
-            recomputeHeadingFromMagnetic()
-            recomputeGpsGeometry()
-            renderState()
-        }
-        swStability.setOnCheckedChangeListener { _, checked ->
-            microStabilization = checked
-            overlay.setMicroStabilizationEnabled(checked)
-            renderState()
-        }
-
-        findViewById<Button>(R.id.btnDiagBack).setOnClickListener { showHome() }
-        findViewById<Button>(R.id.btnCalibrateFromDiag).setOnClickListener { showPanel(panelCalibration) }
-        findViewById<Button>(R.id.btnCalibrationBack).setOnClickListener { showHome() }
-        findViewById<Button>(R.id.btnCalibrationDone).setOnClickListener { showHome() }
-        findViewById<Button>(R.id.btnGuideBack).setOnClickListener { showHome() }
-        findViewById<Button>(R.id.btnAboutBack).setOnClickListener { showHome() }
-    }
-
-    private fun bindArCoreFrames() {
-        arView.onFrameState = { state ->
-            arFrameState = state
-            arCoreStatus = when {
-                state.tracking && state.anchorReady -> "WORLD LOCKED"
-                state.tracking -> "TRACKING"
-                else -> state.cameraTrackingState.name
-            }
+        uiView = findViewById(R.id.uiView)
+        arView.setDisplayRotation(display?.rotation ?: Surface.ROTATION_0)
+        arView.onFrameState = {
+            arFrame = it
             maybeAutoCreateTarget()
-            renderState()
+            renderUi()
         }
+        uiView.onAction = ::handleUiAction
+        requestPermissionsIfNeeded()
+        renderUi()
     }
 
     override fun onResume() {
         super.onResume()
-        sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
-        }
+        registerSensors()
         if (hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)) startLocationUpdates()
-        if (hasPermission(Manifest.permission.CAMERA)) resumeArCore()
+        if (hasPermission(Manifest.permission.CAMERA)) ensureArSession()
     }
 
     override fun onPause() {
-        arView.onPause()
-        try { arSession?.pause() } catch (_: Throwable) {}
-        fusedLocation.removeLocationUpdates(locationCallback)
-        sensorManager.unregisterListener(this)
         super.onPause()
+        sensorManager.unregisterListener(this)
+        fusedLocation.removeLocationUpdates(locationCallback)
+        if (arRunning) {
+            arView.onPause()
+            arSession?.pause()
+            arRunning = false
+        }
     }
 
     override fun onDestroy() {
-        arView.detachSession()
-        try { arSession?.close() } catch (_: Throwable) {}
-        arSession = null
         super.onDestroy()
+        arView.detachSession()
+        arSession?.close()
+        arSession = null
     }
 
-    private fun resumeArCore() {
-        if (!hasPermission(Manifest.permission.CAMERA)) return
-        try {
-            if (arSession == null) {
-                when (ArCoreApk.getInstance().requestInstall(this, !installRequested)) {
-                    ArCoreApk.InstallStatus.INSTALL_REQUESTED -> {
-                        installRequested = true
-                        arCoreStatus = "INSTALLING ARCORE"
-                        return
-                    }
-                    ArCoreApk.InstallStatus.INSTALLED -> Unit
-                }
-                val session = Session(this)
-                val config = Config(session).apply {
-                    focusMode = Config.FocusMode.AUTO
-                    planeFindingMode = Config.PlaneFindingMode.DISABLED
-                    updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
-                }
-                session.configure(config)
-                arSession = session
-                arView.attachSession(session)
-            }
+    private fun requestPermissionsIfNeeded() {
+        val needed = mutableListOf<String>()
+        if (!hasPermission(Manifest.permission.CAMERA)) needed += Manifest.permission.CAMERA
+        if (!hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)) needed += Manifest.permission.ACCESS_FINE_LOCATION
+        if (!hasPermission(Manifest.permission.ACCESS_COARSE_LOCATION)) needed += Manifest.permission.ACCESS_COARSE_LOCATION
+        if (needed.isNotEmpty()) permissionLauncher.launch(needed.toTypedArray())
+    }
 
+    private fun hasPermission(permission: String) = ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
+
+    private fun ensureArSession() {
+        if (!hasPermission(Manifest.permission.CAMERA) || arRunning) return
+        try {
+            when (ArCoreApk.getInstance().requestInstall(this, !installRequested)) {
+                ArCoreApk.InstallStatus.INSTALL_REQUESTED -> { installRequested = true; return }
+                ArCoreApk.InstallStatus.INSTALLED -> Unit
+            }
+            val session = arSession ?: Session(this).also { s ->
+                val config = Config(s).apply {
+                    focusMode = Config.FocusMode.AUTO
+                    updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
+                    planeFindingMode = Config.PlaneFindingMode.DISABLED
+                    lightEstimationMode = Config.LightEstimationMode.DISABLED
+                }
+                s.configure(config)
+                arSession = s
+                arView.attachSession(s)
+            }
             arView.setDisplayRotation(display?.rotation ?: Surface.ROTATION_0)
-            arSession?.resume()
+            session.resume()
             arView.onResume()
-            arCoreStatus = "TRACKING START"
-        } catch (t: Throwable) {
-            arCoreStatus = "ARCORE ERROR"
-            showToast("ARCore could not start: ${t.javaClass.simpleName}")
-            renderState()
+            arRunning = true
+        } catch (e: Throwable) {
+            toast("ARCore is unavailable on this device")
         }
     }
 
     @SuppressLint("MissingPermission")
     private fun startLocationUpdates() {
         if (!hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)) return
-        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 1000L)
-            .setMinUpdateIntervalMillis(600L)
+        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 900L)
+            .setMinUpdateIntervalMillis(450L)
             .setMinUpdateDistanceMeters(0.5f)
             .setWaitForAccurateLocation(false)
             .build()
@@ -310,8 +177,35 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         fusedLocation.requestLocationUpdates(request, locationCallback, Looper.getMainLooper())
     }
 
+    private fun registerSensors() {
+        sensorManager.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)?.let {
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+        }
+        sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)?.let {
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+        }
+    }
+
     override fun onSensorChanged(event: SensorEvent) {
-        if (event.sensor.type != Sensor.TYPE_ROTATION_VECTOR) return
+        val yaw = extractYaw(event) ?: return
+        when (event.sensor.type) {
+            Sensor.TYPE_GAME_ROTATION_VECTOR -> updateGameYaw(yaw, event.timestamp)
+            Sensor.TYPE_ROTATION_VECTOR -> updateAbsoluteHeading(yaw)
+        }
+        maybeAutoCreateTarget()
+        recomputeGlobalGeometry()
+        renderUi()
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
+        if (sensor?.type == Sensor.TYPE_ROTATION_VECTOR) {
+            sensorAccuracy = accuracy
+            renderUi()
+        }
+    }
+
+    private fun extractYaw(event: SensorEvent): Double? {
+        if (event.sensor.type != Sensor.TYPE_ROTATION_VECTOR && event.sensor.type != Sensor.TYPE_GAME_ROTATION_VECTOR) return null
         val rotation = FloatArray(9)
         val remapped = FloatArray(9)
         val orientation = FloatArray(3)
@@ -320,254 +214,224 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             Surface.ROTATION_0 -> SensorManager.remapCoordinateSystem(rotation, SensorManager.AXIS_X, SensorManager.AXIS_Y, remapped)
             Surface.ROTATION_90 -> SensorManager.remapCoordinateSystem(rotation, SensorManager.AXIS_Y, SensorManager.AXIS_MINUS_X, remapped)
             Surface.ROTATION_180 -> SensorManager.remapCoordinateSystem(rotation, SensorManager.AXIS_MINUS_X, SensorManager.AXIS_MINUS_Y, remapped)
-            Surface.ROTATION_270 -> SensorManager.remapCoordinateSystem(rotation, SensorManager.AXIS_MINUS_Y, SensorManager.AXIS_X, remapped)
+            else -> SensorManager.remapCoordinateSystem(rotation, SensorManager.AXIS_MINUS_Y, SensorManager.AXIS_X, remapped)
         }
         SensorManager.getOrientation(remapped, orientation)
-        val magnetic = BearingMath.normalizeDegrees(Math.toDegrees(orientation[0].toDouble()))
+        return BearingMath.normalizeDegrees(Math.toDegrees(orientation[0].toDouble()))
+    }
+
+    private fun updateGameYaw(yaw: Double, timestamp: Long) {
+        gameYaw = yaw
+        previousGameYaw?.let { previous ->
+            val dt = (timestamp - previousGameTimestamp) / 1_000_000_000.0
+            if (dt > 0.002) {
+                val speed = abs(BearingMath.angleDifference(yaw, previous)) / dt
+                turnSpeed = turnSpeed * 0.78 + min(speed, 360.0) * 0.22
+            }
+        }
+        previousGameYaw = yaw
+        previousGameTimestamp = timestamp
+    }
+
+    private fun updateAbsoluteHeading(magnetic: Double) {
         magneticHeading = magnetic
-
-        lastHeadingSample?.let { previous ->
-            val movement = abs(BearingMath.angleDifference(magnetic, previous))
-            headingStabilityEstimate = (headingStabilityEstimate * 0.88 + movement * 0.12).coerceIn(0.4, 18.0)
-        }
-        lastHeadingSample = magnetic
-
-        recomputeHeadingFromMagnetic()
-        recomputeGpsGeometry()
-        maybeAutoCreateTarget()
-        renderState()
-    }
-
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
-        if (sensor?.type == Sensor.TYPE_ROTATION_VECTOR) {
-            headingAccuracy = accuracy
-            renderState()
-        }
-    }
-
-    private fun recomputeHeadingFromMagnetic() {
-        val magnetic = magneticHeading ?: return
-        val declination = if (trueNorthCorrection) {
-            currentLocation?.let {
-                GeomagneticField(
-                    it.latitude.toFloat(),
-                    it.longitude.toFloat(),
-                    if (it.hasAltitude()) it.altitude.toFloat() else 0f,
-                    System.currentTimeMillis()
-                ).declination.toDouble()
-            } ?: 0.0
+        val loc = filteredLocation ?: rawLocation
+        val declination = if (declinationEnabled && loc != null) {
+            GeomagneticField(
+                loc.latitude.toFloat(), loc.longitude.toFloat(),
+                if (loc.hasAltitude()) loc.altitude.toFloat() else 0f,
+                System.currentTimeMillis()
+            ).declination.toDouble()
         } else 0.0
-        trueHeading = BearingMath.normalizeDegrees(magnetic + declination)
+        val absolute = BearingMath.normalizeDegrees(magnetic + declination)
+        trueHeading = absolute
+        val previous = filteredHeading
+        if (previous == null) {
+            filteredHeading = absolute
+        } else {
+            val error = BearingMath.angleDifference(absolute, previous)
+            headingStability = headingStability * 0.90 + abs(error) * 0.10
+            val alpha = when (headingSmoothing) {
+                "Stable" -> 0.06
+                "Responsive" -> 0.26
+                else -> 0.13
+            }
+            val adaptive = if (turnSpeed > 30) max(alpha, 0.45) else alpha
+            filteredHeading = BearingMath.normalizeDegrees(previous + error * adaptive)
+        }
+    }
+
+    private fun acceptLocation(location: Location) {
+        rawLocation = location
+        gpsAccuracy = if (location.hasAccuracy()) location.accuracy else Float.MAX_VALUE
+        if (location.hasAccuracy() && location.accuracy > 40f && filteredLocation != null) {
+            renderUi(); return
+        }
+        val previous = filteredLocation
+        filteredLocation = if (previous == null) Location(location) else {
+            val displacement = previous.distanceTo(location).toDouble()
+            val base = when (gpsSmoothing) {
+                "Low" -> 0.55
+                "Medium" -> 0.34
+                else -> 0.20
+            }
+            val accuracyWeight = when {
+                gpsAccuracy <= 4f -> 1.0
+                gpsAccuracy <= 8f -> 0.75
+                gpsAccuracy <= 15f -> 0.45
+                else -> 0.18
+            }
+            val motionBoost = if ((location.hasSpeed() && location.speed > 0.7f) || displacement > 5.0) 0.18 else 0.0
+            val alpha = (base * accuracyWeight + motionBoost).coerceIn(0.05,0.70)
+            Location(location).apply {
+                latitude = previous.latitude + (location.latitude - previous.latitude) * alpha
+                longitude = previous.longitude + (location.longitude - previous.longitude) * alpha
+            }
+        }
+        maybeAutoCreateTarget()
+        recomputeGlobalGeometry()
+        renderUi()
     }
 
     private fun maybeAutoCreateTarget() {
-        if (autoTargetPlaced || treeLat != null) return
-        val location = currentLocation ?: return
-        if (location.accuracy > 15f) return
-        if (trueHeading == null) return
-        if (arFrameState?.tracking != true) return
-        placeTarget(35, silent = true)
+        if (!autoTargetPending || treeLat != null) return
+        val loc = filteredLocation ?: return
+        val heading = filteredHeading ?: trueHeading ?: return
+        if (gpsAccuracy > 10f || !arFrame.tracking) return
+        createTarget(loc, heading, selectedDistance, elevationOffset)
+        autoTargetPending = false
     }
 
-    private fun placeTarget(distanceMeters: Int, silent: Boolean = false) {
-        val location = currentLocation
-        val heading = trueHeading
-        if (location == null || heading == null) {
-            if (!silent) showToast("Wait for GPS and heading before creating a tree")
-            return
-        }
-        if (arFrameState?.tracking != true) {
-            if (!silent) showToast("Wait for AR tracking before creating a tree")
-            return
-        }
-
-        val target = destinationPoint(location.latitude, location.longitude, heading, distanceMeters.toDouble())
-        treeLat = target.first
-        treeLng = target.second
-        autoTargetPlaced = true
-        gpsDistanceMeters = distanceMeters.toFloat()
+    private fun createTarget(location: Location, heading: Double, distance: Int, elevation: Int) {
+        val dest = destinationPoint(location.latitude, location.longitude, heading, distance.toDouble())
+        treeLat = dest.first
+        treeLng = dest.second
         gpsBearing = heading
-        directionDelta = 0.0
-
+        filteredBearing = heading
         arView.clearTargetAnchor()
-        arView.placeTargetAhead(distanceMeters.toFloat())
-        if (!silent) showToast("Tree target locked ${distanceMeters} m ahead")
-        recomputeGpsGeometry()
-        renderState()
+        arView.placeTargetAhead(distance.toFloat(), elevation.toFloat())
+        recomputeGlobalGeometry()
     }
 
-    private fun recomputeGpsGeometry() {
-        val location = currentLocation ?: return
+    private fun recomputeGlobalGeometry() {
+        val loc = filteredLocation ?: return
         val lat = treeLat ?: return
         val lng = treeLng ?: return
-        val result = FloatArray(1)
-        Location.distanceBetween(location.latitude, location.longitude, lat, lng, result)
-        gpsDistanceMeters = result[0]
-        gpsBearing = BearingMath.bearingDegrees(location.latitude, location.longitude, lat, lng)
-        val heading = trueHeading
-        directionDelta = if (heading != null) BearingMath.angleDifference(gpsBearing!!, heading) else null
+        val bearing = BearingMath.bearingDegrees(loc.latitude, loc.longitude, lat, lng)
+        gpsBearing = bearing
+        filteredBearing = filteredBearing?.let { prev ->
+            val error = BearingMath.angleDifference(bearing, prev)
+            BearingMath.normalizeDegrees(prev + error * if (gpsAccuracy <= 8f) 0.20 else 0.08)
+        } ?: bearing
     }
 
-    private fun renderState() {
-        val ar = arFrameState
-        val distance = if (ar?.tracking == true && ar.anchorReady) ar.distanceMeters else gpsDistanceMeters
-        val ready = treeLat != null && (ar?.tracking == true || trueHeading != null)
-        val arLocked = ar?.tracking == true && ar.anchorReady
-
-        overlay.updateTarget(
-            directionDegrees = directionDelta,
-            distanceMeters = distance?.toDouble(),
-            gpsQuality = locationQuality,
-            ready = ready,
-            arTracking = arLocked,
-            arScreenX = ar?.screenX,
-            arScreenY = ar?.screenY,
-            arInFront = ar?.inFront == true,
-            showDistance = showDistance,
-            showGuidance = showGuidance
-        )
-
-        tvGpsStatus.text = if (gpsAccuracy < Float.MAX_VALUE) {
-            "GPS  ${shortGpsQuality()}  ±${String.format("%.1f", gpsAccuracy)} m"
-        } else "GPS  WAITING"
-
-        tvCompassStatus.text = when {
-            trueHeading == null -> "HEADING  WAITING"
-            headingAccuracy == SensorManager.SENSOR_STATUS_UNRELIABLE -> "HEADING  CALIBRATE"
-            else -> "HEADING  ±${String.format("%.1f", headingStabilityEstimate)}°"
-        }
-
-        gpsWarning.visibility = if (gpsAccuracy > 15f && gpsAccuracy < Float.MAX_VALUE) View.VISIBLE else View.GONE
-
-        tvDirection.visibility = if (showGuidance) View.VISIBLE else View.GONE
-        tvDirection.text = directionText(ar)
-        tvDirection.setTextColor(
-            if (arLocked && ar?.inFront == false) 0xFFFF554D.toInt() else 0xFF55E66F.toInt()
-        )
-
-        tvCalibrationHeading.text = "Heading quality: ${headingQuality()}  ·  ${trueHeading?.let { String.format("%.1f°", it) } ?: "--"}"
-        updateDiagnostics()
-    }
-
-    private fun directionText(ar: ArCoreCameraView.FrameState?): String {
-        if (treeLat == null) return "Acquiring target…"
-        if (ar?.tracking == true && ar.anchorReady) {
-            if (!ar.inFront) return "Tree is behind you"
-            val x = ar.screenX
-            if (x != null) {
-                return when {
-                    x < 0.43f -> directionDelta?.let { "Turn left ${abs(it).toInt()}°" } ?: "Turn left"
-                    x > 0.57f -> directionDelta?.let { "Turn right ${abs(it).toInt()}°" } ?: "Turn right"
-                    else -> "Tree is ahead"
+    private fun handleUiAction(action: TreeNavigatorUiView.Action) {
+        when (action) {
+            TreeNavigatorUiView.Action.OPEN_MENU -> open(TreeNavigatorUiView.Screen.MENU)
+            TreeNavigatorUiView.Action.OPEN_SETTINGS -> open(TreeNavigatorUiView.Screen.SETTINGS)
+            TreeNavigatorUiView.Action.OPEN_CREATE -> open(TreeNavigatorUiView.Screen.CREATE)
+            TreeNavigatorUiView.Action.OPEN_DIAGNOSTICS -> open(TreeNavigatorUiView.Screen.DIAGNOSTICS)
+            TreeNavigatorUiView.Action.OPEN_CALIBRATION -> open(TreeNavigatorUiView.Screen.CALIBRATION)
+            TreeNavigatorUiView.Action.OPEN_GUIDE -> open(TreeNavigatorUiView.Screen.GUIDE)
+            TreeNavigatorUiView.Action.OPEN_ABOUT -> open(TreeNavigatorUiView.Screen.ABOUT)
+            TreeNavigatorUiView.Action.GO_HOME -> { uiView.screen = TreeNavigatorUiView.Screen.HOME; renderUi() }
+            TreeNavigatorUiView.Action.BACK -> { uiView.screen = previousScreen; renderUi() }
+            TreeNavigatorUiView.Action.EXIT -> finish()
+            TreeNavigatorUiView.Action.CYCLE_DISTANCE -> { selectedDistance = if (selectedDistance >= 100) 10 else selectedDistance + 5; renderUi() }
+            TreeNavigatorUiView.Action.CYCLE_ELEVATION -> { elevationOffset = when (elevationOffset) { 0->1;1->2;2->-2;-2->-1;else->0 }; renderUi() }
+            TreeNavigatorUiView.Action.CREATE_TARGET -> {
+                val loc = filteredLocation ?: rawLocation
+                val heading = filteredHeading ?: trueHeading
+                if (loc == null || heading == null || !arFrame.tracking) toast("Wait for GPS, heading and AR tracking")
+                else {
+                    createTarget(loc, heading, selectedDistance, elevationOffset)
+                    autoTargetPending = false
+                    uiView.screen = TreeNavigatorUiView.Screen.HOME
+                    toast("Target tree locked ${selectedDistance} m ahead")
                 }
             }
-        }
-        val delta = directionDelta ?: return "Acquiring direction…"
-        return when {
-            abs(delta) <= 3.0 -> "Tree is ahead"
-            abs(delta) >= 150.0 -> "Tree is behind you"
-            delta < 0 -> "Turn left ${abs(delta).toInt()}°"
-            else -> "Turn right ${abs(delta).toInt()}°"
-        }
-    }
-
-    private fun updateDiagnostics() {
-        val ar = arFrameState
-        tvDiagnostics.text = buildString {
-            appendLine("TRACKING")
-            appendLine("ARCore status       ${arCoreStatus}")
-            appendLine("Camera tracking     ${ar?.cameraTrackingState ?: "--"}")
-            appendLine("World anchor        ${if (ar?.anchorReady == true) "ACTIVE" else "--"}")
-            appendLine("Anchor in front     ${ar?.inFront ?: "--"}")
-            appendLine("AR screen X         ${ar?.screenX?.let { String.format("%.3f", it) } ?: "--"}")
-            appendLine("AR screen Y         ${ar?.screenY?.let { String.format("%.3f", it) } ?: "--"}")
-            appendLine("AR distance         ${ar?.distanceMeters?.let { String.format("%.2f m", it) } ?: "--"}")
-            appendLine()
-            appendLine("GLOBAL POSITION")
-            appendLine("GPS quality         $locationQuality")
-            appendLine("GPS accuracy        ${if (gpsAccuracy < Float.MAX_VALUE) String.format("±%.1f m", gpsAccuracy) else "--"}")
-            appendLine("Phone GPS           ${locationText(currentLocation)}")
-            appendLine("Tree GPS            ${treeText()}")
-            appendLine("GPS distance        ${gpsDistanceMeters?.let { String.format("%.2f m", it) } ?: "--"}")
-            appendLine("GPS bearing         ${gpsBearing?.let { String.format("%.1f°", it) } ?: "--"}")
-            appendLine()
-            appendLine("HEADING")
-            appendLine("Magnetic heading    ${magneticHeading?.let { String.format("%.1f°", it) } ?: "--"}")
-            appendLine("True heading        ${trueHeading?.let { String.format("%.1f°", it) } ?: "--"}")
-            appendLine("Heading stability   ±${String.format("%.1f°", headingStabilityEstimate)}")
-            appendLine("Direction delta     ${directionDelta?.let { String.format("%+.1f°", it) } ?: "--"}")
-            appendLine()
-            appendLine("SETTINGS")
-            appendLine("True north          ${if (trueNorthCorrection) "ON" else "OFF"}")
-            appendLine("Micro stabilization ${if (microStabilization) "ON" else "OFF"}")
-            appendLine("Show distance       ${if (showDistance) "ON" else "OFF"}")
-            append("Show guidance       ${if (showGuidance) "ON" else "OFF"}")
+            TreeNavigatorUiView.Action.TOGGLE_DISTANCE -> { showDistance = !showDistance; renderUi() }
+            TreeNavigatorUiView.Action.TOGGLE_GUIDANCE -> { showGuidance = !showGuidance; renderUi() }
+            TreeNavigatorUiView.Action.TOGGLE_DECLINATION -> { declinationEnabled = !declinationEnabled; renderUi() }
+            TreeNavigatorUiView.Action.CYCLE_HEADING_SMOOTHING -> {
+                headingSmoothing = when(headingSmoothing){"Balanced"->"Stable";"Stable"->"Responsive";else->"Balanced"}; renderUi()
+            }
+            TreeNavigatorUiView.Action.CYCLE_GPS_SMOOTHING -> {
+                gpsSmoothing = when(gpsSmoothing){"High"->"Medium";"Medium"->"Low";else->"High"}; renderUi()
+            }
         }
     }
 
-    private fun showPanel(panel: View) {
-        panels.forEach { it.visibility = View.GONE }
-        panel.visibility = View.VISIBLE
-        if (panel == panelDiagnostics) updateDiagnostics()
+    private fun open(screen: TreeNavigatorUiView.Screen) {
+        previousScreen = if (uiView.screen == TreeNavigatorUiView.Screen.MENU) TreeNavigatorUiView.Screen.HOME else uiView.screen
+        uiView.screen = screen
+        renderUi()
     }
 
-    private fun showHome() {
-        panels.forEach { it.visibility = View.GONE }
-    }
-
-    override fun onBackPressed() {
-        if (panels.any { it.visibility == View.VISIBLE }) showHome() else super.onBackPressed()
-    }
-
-    private fun updateCreateDistanceUi() {
-        tvCreateDistance.text = "$createDistanceMeters m"
-        tvCreateDistanceHero.text = "$createDistanceMeters m"
-    }
-
-    private fun shortGpsQuality(): String = when (locationQuality) {
-        "EXCELLENT" -> "GOOD"
-        else -> locationQuality
-    }
-
-    private fun headingQuality(): String = when {
-        trueHeading == null -> "Acquiring"
-        headingAccuracy == SensorManager.SENSOR_STATUS_UNRELIABLE -> "Calibrate"
-        headingStabilityEstimate <= 3.0 -> "Good"
-        else -> "Fair"
-    }
-
-    private fun destinationPoint(
-        lat: Double,
-        lng: Double,
-        bearingDeg: Double,
-        distanceMeters: Double
-    ): Pair<Double, Double> {
-        val earthRadius = 6_371_000.0
-        val angularDistance = distanceMeters / earthRadius
-        val bearing = Math.toRadians(bearingDeg)
-        val lat1 = Math.toRadians(lat)
-        val lng1 = Math.toRadians(lng)
-        val lat2 = asin(
-            sin(lat1) * cos(angularDistance) +
-                cos(lat1) * sin(angularDistance) * cos(bearing)
+    private fun renderUi() {
+        val heading = filteredHeading ?: trueHeading
+        val fallbackDelta = if (heading != null && filteredBearing != null) BearingMath.angleDifference(filteredBearing!!, heading) else null
+        val arLocked = arFrame.tracking && arFrame.anchorReady
+        val direction = if (arLocked) arFrame.horizontalAngleDeg else fallbackDelta
+        val globalDistance = filteredLocation?.let { loc ->
+            val lat=treeLat; val lng=treeLng
+            if(lat!=null && lng!=null) {
+                val out=FloatArray(1); Location.distanceBetween(loc.latitude,loc.longitude,lat,lng,out); out[0].toDouble()
+            } else null
+        }
+        val distance = if (arLocked) arFrame.distanceMeters?.toDouble() else globalDistance
+        val gpsQuality = when {
+            gpsAccuracy <= 8f -> "GOOD"
+            gpsAccuracy <= 15f -> "FAIR"
+            gpsAccuracy < Float.MAX_VALUE -> "POOR"
+            else -> "WAITING"
+        }
+        val headingQuality = if (sensorAccuracy == SensorManager.SENSOR_STATUS_UNRELIABLE) "CALIBRATE" else if (heading != null) "GOOD" else "WAITING"
+        uiView.model = TreeNavigatorUiView.Model(
+            gpsQuality=gpsQuality,
+            gpsAccuracy=gpsAccuracy,
+            headingQuality=headingQuality,
+            headingAccuracyDeg=headingStability.coerceIn(0.8,15.0),
+            targetDistanceM=distance,
+            directionDeltaDeg=direction,
+            targetScreenX=arFrame.screenX,
+            targetScreenY=arFrame.screenY,
+            targetInFront=if(arLocked) arFrame.inFront else (direction?.let{abs(it)<90}?:true),
+            targetReady=treeLat!=null && (arFrame.anchorReady || direction!=null),
+            arTracking=arLocked,
+            selectedDistanceM=selectedDistance,
+            elevationOffsetM=elevationOffset,
+            showDistance=showDistance,
+            showGuidance=showGuidance,
+            headingSmoothing=headingSmoothing,
+            gpsSmoothing=gpsSmoothing,
+            declinationEnabled=declinationEnabled,
+            gameYaw=gameYaw,
+            magneticHeading=magneticHeading,
+            trueHeading=trueHeading,
+            filteredHeading=filteredHeading,
+            turnSpeed=turnSpeed,
+            gpsBearing=gpsBearing,
+            filteredBearing=filteredBearing,
+            phoneLat=filteredLocation?.latitude,
+            phoneLng=filteredLocation?.longitude,
+            treeLat=treeLat,
+            treeLng=treeLng,
+            arStatus=when {
+                arLocked -> "WORLD LOCKED"
+                arFrame.tracking -> "TRACKING"
+                else -> arFrame.cameraTrackingState.name
+            }
         )
-        val lng2 = lng1 + atan2(
-            sin(bearing) * sin(angularDistance) * cos(lat1),
-            cos(angularDistance) - sin(lat1) * sin(lat2)
-        )
-        return Math.toDegrees(lat2) to Math.toDegrees(lng2)
     }
 
-    private fun treeText(): String = if (treeLat != null && treeLng != null) {
-        String.format("%.7f, %.7f", treeLat, treeLng)
-    } else "--"
+    private fun destinationPoint(lat: Double, lng: Double, bearingDeg: Double, distanceMeters: Double): Pair<Double,Double> {
+        val earth=6_371_000.0; val d=distanceMeters/earth; val b=Math.toRadians(bearingDeg)
+        val lat1=Math.toRadians(lat); val lon1=Math.toRadians(lng)
+        val lat2=asin(sin(lat1)*cos(d)+cos(lat1)*sin(d)*cos(b))
+        val lon2=lon1+atan2(sin(b)*sin(d)*cos(lat1),cos(d)-sin(lat1)*sin(lat2))
+        return Math.toDegrees(lat2) to Math.toDegrees(lon2)
+    }
 
-    private fun locationText(location: Location?): String = location?.let {
-        String.format("%.7f, %.7f", it.latitude, it.longitude)
-    } ?: "--"
-
-    private fun hasPermission(permission: String): Boolean =
-        ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
-
-    private fun showToast(message: String) = Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+    private fun toast(message:String)=Toast.makeText(this,message,Toast.LENGTH_SHORT).show()
 }
