@@ -58,6 +58,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private var headingDegrees: Double? = null
     private var rawHeadingDegrees: Double? = null
+    private var previousRawHeading: Double? = null
+    private var previousSensorTimestampNs: Long? = null
+    private var angularVelocityDps = 0.0
+    private var motionMode = "STILL"
+
     private var rawLocation: Location? = null
     private var effectiveLocation: Location? = null
     private var gpsBearing: Double? = null
@@ -69,13 +74,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var jitterMeters = 6.0
     private var autoTreeCreated = false
 
-    // Tuning values for stability vs responsiveness.
-    private val headingAlpha = 0.08
-    private val headingDeadbandDeg = 1.0
-    private val gpsBearingAlpha = 0.18
-    private val screenDeltaAlpha = 0.14
-    private val screenDeltaDeadbandDeg = 0.7
-    private val maxScreenStepDeg = 2.5
+    // GPS is a slow absolute reference. Keep this deliberately smooth.
+    private val gpsBearingAlpha = 0.14
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -204,6 +204,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         super.onPause()
         sensorManager.unregisterListener(this)
         fusedLocation.removeLocationUpdates(locationCallback)
+        previousSensorTimestampNs = null
+        previousRawHeading = null
     }
 
     override fun onDestroy() {
@@ -213,32 +215,84 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     override fun onSensorChanged(event: SensorEvent) {
         if (event.sensor.type != Sensor.TYPE_ROTATION_VECTOR) return
+
         val rotation = FloatArray(9)
         val remapped = FloatArray(9)
         val orientation = FloatArray(3)
         SensorManager.getRotationMatrixFromVector(rotation, event.values)
+
         when (display?.rotation ?: Surface.ROTATION_0) {
             Surface.ROTATION_0 -> SensorManager.remapCoordinateSystem(rotation, SensorManager.AXIS_X, SensorManager.AXIS_Y, remapped)
             Surface.ROTATION_90 -> SensorManager.remapCoordinateSystem(rotation, SensorManager.AXIS_Y, SensorManager.AXIS_MINUS_X, remapped)
             Surface.ROTATION_180 -> SensorManager.remapCoordinateSystem(rotation, SensorManager.AXIS_MINUS_X, SensorManager.AXIS_MINUS_Y, remapped)
             Surface.ROTATION_270 -> SensorManager.remapCoordinateSystem(rotation, SensorManager.AXIS_MINUS_Y, SensorManager.AXIS_X, remapped)
         }
-        SensorManager.getOrientation(remapped, orientation)
 
+        SensorManager.getOrientation(remapped, orientation)
         val rawHeading = BearingMath.normalizeDegrees(Math.toDegrees(orientation[0].toDouble()))
         rawHeadingDegrees = rawHeading
 
+        updateAngularVelocity(rawHeading, event.timestamp)
+
         headingDegrees = headingDegrees?.let { prev ->
             val error = BearingMath.angleDifference(rawHeading, prev)
-            if (abs(error) < headingDeadbandDeg) {
+            val tuning = headingTuning(angularVelocityDps)
+
+            if (abs(error) < tuning.deadbandDeg) {
                 prev
             } else {
-                BearingMath.normalizeDegrees(prev + error * headingAlpha)
+                BearingMath.normalizeDegrees(prev + error * tuning.alpha)
             }
         } ?: rawHeading
 
         maybeCreateTestTree()
         renderState()
+    }
+
+    private fun updateAngularVelocity(rawHeading: Double, timestampNs: Long) {
+        val lastHeading = previousRawHeading
+        val lastTimestamp = previousSensorTimestampNs
+
+        if (lastHeading != null && lastTimestamp != null && timestampNs > lastTimestamp) {
+            val dt = (timestampNs - lastTimestamp) / 1_000_000_000.0
+            if (dt in 0.001..0.25) {
+                val instantVelocity = abs(BearingMath.angleDifference(rawHeading, lastHeading)) / dt
+                // Smooth the velocity itself so one noisy sample cannot switch modes aggressively.
+                angularVelocityDps = angularVelocityDps * 0.72 + instantVelocity * 0.28
+            }
+        }
+
+        previousRawHeading = rawHeading
+        previousSensorTimestampNs = timestampNs
+
+        motionMode = when {
+            angularVelocityDps < 3.0 -> "STILL"
+            angularVelocityDps < 15.0 -> "SLOW"
+            angularVelocityDps < 60.0 -> "TURNING"
+            else -> "FAST TURN"
+        }
+    }
+
+    private data class HeadingTuning(val alpha: Double, val deadbandDeg: Double)
+
+    private fun headingTuning(velocityDps: Double): HeadingTuning = when {
+        velocityDps < 3.0 -> HeadingTuning(alpha = 0.035, deadbandDeg = 1.25)
+        velocityDps < 15.0 -> HeadingTuning(alpha = 0.10, deadbandDeg = 0.70)
+        velocityDps < 60.0 -> HeadingTuning(alpha = 0.24, deadbandDeg = 0.30)
+        else -> HeadingTuning(alpha = 0.45, deadbandDeg = 0.10)
+    }
+
+    private data class MarkerTuning(
+        val alpha: Double,
+        val deadbandDeg: Double,
+        val maxStepDeg: Double
+    )
+
+    private fun markerTuning(velocityDps: Double): MarkerTuning = when {
+        velocityDps < 3.0 -> MarkerTuning(alpha = 0.055, deadbandDeg = 0.85, maxStepDeg = 0.7)
+        velocityDps < 15.0 -> MarkerTuning(alpha = 0.14, deadbandDeg = 0.45, maxStepDeg = 2.0)
+        velocityDps < 60.0 -> MarkerTuning(alpha = 0.30, deadbandDeg = 0.20, maxStepDeg = 6.0)
+        else -> MarkerTuning(alpha = 0.52, deadbandDeg = 0.08, maxStepDeg = 14.0)
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
@@ -287,7 +341,13 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         val newBearing = BearingMath.bearingDegrees(loc.latitude, loc.longitude, lat, lng)
         gpsBearing = newBearing
         smoothedGpsBearing = smoothedGpsBearing?.let { prev ->
-            BearingMath.normalizeDegrees(prev + BearingMath.angleDifference(newBearing, prev) * gpsBearingAlpha)
+            val error = BearingMath.angleDifference(newBearing, prev)
+            val gpsDeadband = if ((distanceToTreeMeters ?: 100f) < 12f) 1.2 else 0.5
+            if (abs(error) < gpsDeadband) {
+                prev
+            } else {
+                BearingMath.normalizeDegrees(prev + error * gpsBearingAlpha)
+            }
         } ?: newBearing
 
         val result = FloatArray(1)
@@ -313,14 +373,15 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         val heading = headingDegrees
         val target = smoothedGpsBearing ?: gpsBearing
         val rawDelta = if (heading != null && target != null) BearingMath.angleDifference(target, heading) else 0.0
+        val tuning = markerTuning(angularVelocityDps)
 
         val stableDelta = smoothedScreenDelta?.let { prev ->
             val error = BearingMath.angleDifference(rawDelta, prev)
-            if (abs(error) < screenDeltaDeadbandDeg) {
+            if (abs(error) < tuning.deadbandDeg) {
                 prev
             } else {
-                val desiredStep = error * screenDeltaAlpha
-                val limitedStep = desiredStep.coerceIn(-maxScreenStepDeg, maxScreenStepDeg)
+                val desiredStep = error * tuning.alpha
+                val limitedStep = desiredStep.coerceIn(-tuning.maxStepDeg, tuning.maxStepDeg)
                 BearingMath.normalizeSignedDegrees(prev + limitedStep)
             }
         } ?: rawDelta
@@ -329,7 +390,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         overlay.updateDirection(stableDelta, true, "FIXED TREE")
 
         tvDebug.text = buildString {
-            appendLine("MODE: FIXED TREE / NOISE FILTERED")
+            appendLine("MODE: FIXED TREE / ADAPTIVE FILTER")
+            appendLine("Motion mode    : $motionMode")
+            appendLine("Turn speed     : ${String.format("%.1f", angularVelocityDps)}°/s")
             appendLine("Raw heading    : ${fmt(rawHeadingDegrees)}°")
             appendLine("Camera heading : ${fmt(heading)}°")
             appendLine("Initial bearing: ${fmt(setupBearing)}°")
