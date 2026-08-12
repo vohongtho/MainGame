@@ -18,6 +18,11 @@
         <meta-data android:name="com.google.ar.core" android:value="required" />
 
         <activity
+            android:name=".UiPreviewActivity"
+            android:exported="true"
+            android:screenOrientation="portrait" />
+
+        <activity
             android:name=".MainActivity"
             android:exported="true"
             android:screenOrientation="portrait">
