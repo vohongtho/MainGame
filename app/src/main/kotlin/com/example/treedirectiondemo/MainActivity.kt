@@ -9,6 +9,7 @@ import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.location.Location
+import android.os.Build
 import android.os.Bundle
 import android.os.Looper
 import android.view.Surface
@@ -58,8 +59,12 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private var rawLocation: Location? = null
     private var filteredLocation: Location? = null
+    private var navigationLocation: Location? = null
     private var gpsAccuracy = Float.MAX_VALUE
     private var locationQuality = "WAITING"
+    private var navigationHoldMeters = 0.0
+    private var bearingUncertaintyDeg = 180.0
+    private var targetAreaMode = false
 
     private var magneticHeading: Double? = null
     private var trueHeading: Double? = null
@@ -86,7 +91,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         val locationOk = result[Manifest.permission.ACCESS_FINE_LOCATION] == true || hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)
         if (cameraOk) startCamera()
         if (locationOk) startLocationUpdates()
-        if (!locationOk) showToast("Precise location is required for tree direction")
+        if (!locationOk) showToast("Precise location is required for tree navigation")
     }
 
     private val locationCallback = object : LocationCallback() {
@@ -124,6 +129,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             rawBearing = null
             filteredBearing = null
             displayDelta = null
+            targetAreaMode = false
             maybeCreateTestTree(force = true)
         }
         btnDebug.setOnClickListener {
@@ -159,9 +165,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     @SuppressLint("MissingPermission")
     private fun startLocationUpdates() {
         if (!hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)) return
-        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 800L)
-            .setMinUpdateIntervalMillis(400L)
-            .setMinUpdateDistanceMeters(0.5f)
+        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 900L)
+            .setMinUpdateIntervalMillis(600L)
+            .setMinUpdateDistanceMeters(0.8f)
             .setWaitForAccurateLocation(false)
             .build()
         fusedLocation.requestLocationUpdates(request, locationCallback, Looper.getMainLooper())
@@ -223,25 +229,24 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             val dt = (timestampNs - lastGameTimestampNs) / 1_000_000_000.0
             if (dt > 0.001) {
                 val instant = abs(BearingMath.angleDifference(yaw, previous)) / dt
-                turnSpeedDegPerSec = turnSpeedDegPerSec * 0.75 + min(instant, 360.0) * 0.25
+                turnSpeedDegPerSec = turnSpeedDegPerSec * 0.78 + min(instant, 360.0) * 0.22
             }
         }
         lastGameYaw = yaw
         lastGameTimestampNs = timestampNs
 
-        val offset = absoluteOffset
-        if (offset != null) {
+        absoluteOffset?.let { offset ->
             val target = BearingMath.normalizeDegrees(yaw + offset)
             val previous = fusedHeading
             fusedHeading = if (previous == null) target else {
                 val error = BearingMath.angleDifference(target, previous)
                 val alpha = when {
-                    turnSpeedDegPerSec < 2.0 -> 0.10
-                    turnSpeedDegPerSec < 12.0 -> 0.22
-                    turnSpeedDegPerSec < 45.0 -> 0.45
-                    else -> 0.72
+                    turnSpeedDegPerSec < 2.0 -> 0.08
+                    turnSpeedDegPerSec < 12.0 -> 0.20
+                    turnSpeedDegPerSec < 45.0 -> 0.44
+                    else -> 0.76
                 }
-                if (turnSpeedDegPerSec < 2.0 && abs(error) < 0.45) previous
+                if (turnSpeedDegPerSec < 2.0 && abs(error) < 0.40) previous
                 else BearingMath.normalizeDegrees(previous + error * alpha)
             }
         }
@@ -249,7 +254,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private fun onAbsoluteYaw(magneticYaw: Double) {
         magneticHeading = magneticYaw
-        val loc = filteredLocation ?: rawLocation
+        val loc = navigationLocation ?: filteredLocation ?: rawLocation
         val declination = loc?.let {
             GeomagneticField(
                 it.latitude.toFloat(),
@@ -265,8 +270,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         if (gy != null) {
             val measuredOffset = BearingMath.angleDifference(absoluteTrue, gy)
             absoluteOffset = absoluteOffset?.let { prev ->
-                // Slow magnetic correction: smooth relative movement comes from the game vector.
-                BearingMath.normalizeSignedDegrees(prev + BearingMath.angleDifference(measuredOffset, prev) * 0.025)
+                BearingMath.normalizeSignedDegrees(prev + BearingMath.angleDifference(measuredOffset, prev) * 0.018)
             } ?: measuredOffset
             if (fusedHeading == null) fusedHeading = absoluteTrue
         } else {
@@ -276,12 +280,12 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private fun acceptLocation(location: Location) {
         rawLocation = location
-        gpsAccuracy = location.accuracy
+        gpsAccuracy = if (location.hasAccuracy()) location.accuracy else Float.MAX_VALUE
         locationQuality = when {
             !location.hasAccuracy() -> "POOR"
-            location.accuracy <= 5f -> "EXCELLENT"
-            location.accuracy <= 9f -> "GOOD"
-            location.accuracy <= 15f -> "FAIR"
+            location.accuracy <= 4f -> "EXCELLENT"
+            location.accuracy <= 8f -> "GOOD"
+            location.accuracy <= 14f -> "FAIR"
             else -> "POOR"
         }
 
@@ -290,44 +294,86 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             return
         }
 
-        val previous = filteredLocation
-        filteredLocation = if (previous == null) {
-            Location(location)
-        } else {
-            val displacement = previous.distanceTo(location).toDouble()
-            val accuracyAlpha = when {
-                location.accuracy <= 4f -> 0.55
-                location.accuracy <= 8f -> 0.35
-                location.accuracy <= 15f -> 0.20
-                else -> 0.10
-            }
-            val motionBoost = when {
-                displacement > 5.0 -> 0.30
-                displacement > 2.0 -> 0.15
-                else -> 0.0
-            }
-            val alpha = min(0.75, accuracyAlpha + motionBoost)
-            if (displacement < max(0.6, location.accuracy * 0.12) && location.accuracy >= previous.accuracy) {
-                Location(previous)
-            } else {
-                Location(location).apply {
-                    latitude = previous.latitude + (location.latitude - previous.latitude) * alpha
-                    longitude = previous.longitude + (location.longitude - previous.longitude) * alpha
-                    accuracy = min(previous.accuracy, location.accuracy)
-                }
-            }
-        }
-
+        updateFilteredLocation(location)
+        updateNavigationLocation(location)
         maybeCreateTestTree()
         recomputeGeometry()
         renderState()
     }
 
+    private fun updateFilteredLocation(location: Location) {
+        val previous = filteredLocation
+        filteredLocation = if (previous == null) {
+            Location(location)
+        } else {
+            val displacement = previous.distanceTo(location).toDouble()
+            val alpha = when {
+                location.accuracy <= 4f -> 0.42
+                location.accuracy <= 8f -> 0.28
+                location.accuracy <= 14f -> 0.16
+                else -> 0.08
+            } + when {
+                location.hasSpeed() && location.speed > 1.6f -> 0.18
+                location.hasSpeed() && location.speed > 0.7f -> 0.10
+                displacement > 5.0 -> 0.12
+                else -> 0.0
+            }
+            val boundedAlpha = min(0.65, alpha)
+            Location(location).apply {
+                latitude = previous.latitude + (location.latitude - previous.latitude) * boundedAlpha
+                longitude = previous.longitude + (location.longitude - previous.longitude) * boundedAlpha
+                accuracy = max(1f, min(previous.accuracy, location.accuracy))
+            }
+        }
+    }
+
+    private fun updateNavigationLocation(location: Location) {
+        val candidate = filteredLocation ?: Location(location)
+        val previous = navigationLocation
+        if (previous == null) {
+            navigationLocation = Location(candidate)
+            return
+        }
+
+        val displacement = previous.distanceTo(candidate).toDouble()
+        val uncertaintyRadius = max(1.6, min(7.0, location.accuracy * 0.38))
+        val speed = if (location.hasSpeed()) location.speed.toDouble() else 0.0
+        val moving = speed > 0.45 || displacement > uncertaintyRadius + 1.5
+
+        if (!moving || displacement <= uncertaintyRadius) {
+            navigationHoldMeters = displacement
+            return
+        }
+
+        val trustedMovement = displacement - uncertaintyRadius
+        val movementRatio = (trustedMovement / displacement).coerceIn(0.0, 1.0)
+        val speedWeight = when {
+            speed > 1.8 -> 0.72
+            speed > 1.0 -> 0.58
+            speed > 0.45 -> 0.42
+            else -> 0.30
+        }
+        val accuracyWeight = when {
+            location.accuracy <= 4f -> 1.0
+            location.accuracy <= 8f -> 0.78
+            location.accuracy <= 14f -> 0.52
+            else -> 0.28
+        }
+        val alpha = (movementRatio * speedWeight * accuracyWeight).coerceIn(0.10, 0.65)
+
+        navigationLocation = Location(candidate).apply {
+            latitude = previous.latitude + (candidate.latitude - previous.latitude) * alpha
+            longitude = previous.longitude + (candidate.longitude - previous.longitude) * alpha
+            accuracy = location.accuracy
+        }
+        navigationHoldMeters = 0.0
+    }
+
     private fun maybeCreateTestTree(force: Boolean = false) {
         if (autoTreeCreated && !force) return
-        val start = filteredLocation ?: rawLocation ?: return
+        val start = navigationLocation ?: filteredLocation ?: rawLocation ?: return
         val heading = fusedHeading ?: trueHeading ?: return
-        if (!force && gpsAccuracy > 18f) return
+        if (!force && gpsAccuracy > 16f) return
 
         val dest = destinationPoint(start.latitude, start.longitude, heading, testTreeDistanceMeters)
         treeLat = dest.first
@@ -336,46 +382,70 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         filteredBearing = heading
         displayDelta = 0.0
         recomputeGeometry()
-        showToast("Tree target fixed 35 m ahead")
+        showToast("Target tree placed 35 m ahead")
     }
 
     private fun recomputeGeometry() {
-        val loc = filteredLocation ?: return
+        val loc = navigationLocation ?: return
         val lat = treeLat ?: return
         val lng = treeLng ?: return
-        val bearing = BearingMath.bearingDegrees(loc.latitude, loc.longitude, lat, lng)
-        rawBearing = bearing
-        filteredBearing = filteredBearing?.let { prev ->
-            val error = BearingMath.angleDifference(bearing, prev)
-            val alpha = when {
-                distanceToTreeMeters != null && distanceToTreeMeters!! < 8f -> 0.55
-                gpsAccuracy <= 5f -> 0.45
-                gpsAccuracy <= 10f -> 0.28
-                else -> 0.16
-            }
-            BearingMath.normalizeDegrees(prev + error * alpha)
-        } ?: bearing
 
         val result = FloatArray(1)
         Location.distanceBetween(loc.latitude, loc.longitude, lat, lng, result)
         distanceToTreeMeters = result[0]
+        val distance = max(0.5, result[0].toDouble())
+
+        val bearing = BearingMath.bearingDegrees(loc.latitude, loc.longitude, lat, lng)
+        rawBearing = bearing
+
+        bearingUncertaintyDeg = Math.toDegrees(atan2(max(1.0, gpsAccuracy * 0.45).toDouble(), distance))
+            .coerceIn(0.5, 75.0)
+        targetAreaMode = distance <= max(6.0, gpsAccuracy * 1.35)
+
+        filteredBearing = if (targetAreaMode) {
+            filteredBearing ?: bearing
+        } else {
+            filteredBearing?.let { prev ->
+                val error = BearingMath.angleDifference(bearing, prev)
+                val deadband = max(0.8, bearingUncertaintyDeg * 0.42)
+                if (abs(error) <= deadband) {
+                    prev
+                } else {
+                    val alpha = when {
+                        gpsAccuracy <= 4f -> 0.26
+                        gpsAccuracy <= 8f -> 0.18
+                        gpsAccuracy <= 14f -> 0.11
+                        else -> 0.06
+                    }
+                    BearingMath.normalizeDegrees(prev + error * alpha)
+                }
+            } ?: bearing
+        }
     }
 
     private fun renderState() {
         val heading = fusedHeading ?: trueHeading
         val bearing = filteredBearing ?: rawBearing
         val rawDelta = if (heading != null && bearing != null) BearingMath.angleDifference(bearing, heading) else null
-        if (rawDelta != null) {
+
+        if (rawDelta != null && !targetAreaMode) {
             displayDelta = displayDelta?.let { prev ->
                 val error = BearingMath.angleDifference(rawDelta, prev)
-                val alpha = when {
-                    turnSpeedDegPerSec < 2.0 -> 0.08
-                    turnSpeedDegPerSec < 12.0 -> 0.20
-                    turnSpeedDegPerSec < 45.0 -> 0.42
-                    else -> 0.70
+                val deadband = when {
+                    turnSpeedDegPerSec < 2.0 -> max(0.45, bearingUncertaintyDeg * 0.20)
+                    else -> 0.25
                 }
-                if (turnSpeedDegPerSec < 2.0 && abs(error) < 0.55) prev
-                else BearingMath.normalizeSignedDegrees(prev + error * alpha)
+                if (abs(error) <= deadband) {
+                    prev
+                } else {
+                    val alpha = when {
+                        turnSpeedDegPerSec < 2.0 -> 0.06
+                        turnSpeedDegPerSec < 12.0 -> 0.18
+                        turnSpeedDegPerSec < 45.0 -> 0.42
+                        else -> 0.74
+                    }
+                    BearingMath.normalizeSignedDegrees(prev + error * alpha)
+                }
             } ?: rawDelta
         }
 
@@ -385,11 +455,15 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             deltaDegrees = delta,
             distanceMeters = distance?.toDouble(),
             gpsQuality = locationQuality,
-            ready = treeLat != null && heading != null
+            ready = treeLat != null && heading != null,
+            targetArea = targetAreaMode,
+            uncertaintyDegrees = bearingUncertaintyDeg
         )
 
         tvDistance.text = distance?.let { if (it < 10f) String.format("%.1f m", it) else String.format("%.0f m", it) } ?: "-- m"
         tvDirection.text = when {
+            treeLat == null || heading == null -> "Acquiring location & heading…"
+            targetAreaMode -> "Target area reached"
             delta == null -> "Acquiring direction…"
             abs(delta) <= 3.0 -> "Tree is ahead"
             abs(delta) >= 150.0 -> "Tree is behind you"
@@ -404,17 +478,22 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
         tvDebug.text = buildString {
             appendLine("TRACKING ENGINE")
-            appendLine("Game yaw       : ${fmt(gameYaw)}°")
-            appendLine("Magnetic       : ${fmt(magneticHeading)}°")
-            appendLine("True heading   : ${fmt(trueHeading)}°")
-            appendLine("Fused heading  : ${fmt(fusedHeading)}°")
-            appendLine("Turn speed     : ${String.format("%.1f", turnSpeedDegPerSec)}°/s")
-            appendLine("Raw bearing    : ${fmt(rawBearing)}°")
-            appendLine("Filtered bearing: ${fmt(filteredBearing)}°")
-            appendLine("Display delta  : ${fmt(displayDelta)}°")
-            appendLine("GPS quality    : $locationQuality / ${if (gpsAccuracy < Float.MAX_VALUE) String.format("±%.1f m", gpsAccuracy) else "--"}")
-            appendLine("Phone filtered : ${locText(filteredLocation)}")
-            append("Tree fixed     : ${treeLat?.let { String.format("%.7f", it) } ?: "--"}, ${treeLng?.let { String.format("%.7f", it) } ?: "--"}")
+            appendLine("Game yaw         : ${fmt(gameYaw)}°")
+            appendLine("Magnetic         : ${fmt(magneticHeading)}°")
+            appendLine("True heading     : ${fmt(trueHeading)}°")
+            appendLine("Fused heading    : ${fmt(fusedHeading)}°")
+            appendLine("Turn speed       : ${String.format("%.1f", turnSpeedDegPerSec)}°/s")
+            appendLine("Raw bearing      : ${fmt(rawBearing)}°")
+            appendLine("Filtered bearing : ${fmt(filteredBearing)}°")
+            appendLine("Display delta    : ${fmt(displayDelta)}°")
+            appendLine("Bearing uncertainty: ±${String.format("%.1f", bearingUncertaintyDeg)}°")
+            appendLine("Target area mode : $targetAreaMode")
+            appendLine("GPS quality      : $locationQuality / ${if (gpsAccuracy < Float.MAX_VALUE) String.format("±%.1f m", gpsAccuracy) else "--"}")
+            appendLine("Navigation hold  : ${String.format("%.1f", navigationHoldMeters)} m")
+            appendLine("Raw phone        : ${locText(rawLocation)}")
+            appendLine("Filtered phone   : ${locText(filteredLocation)}")
+            appendLine("Navigation phone : ${locText(navigationLocation)}")
+            append("Tree fixed       : ${treeLat?.let { String.format("%.7f", it) } ?: "--"}, ${treeLng?.let { String.format("%.7f", it) } ?: "--"}")
         }
     }
 
