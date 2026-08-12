@@ -18,9 +18,17 @@ import java.nio.FloatBuffer
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.atan2
+import kotlin.math.hypot
 import kotlin.math.sqrt
 
-/** ARCore camera + world-anchor projection. GPS never repositions the anchor. */
+/**
+ * ARCore camera + world-anchor projection.
+ *
+ * Important contract:
+ * - GPS never repositions the AR anchor.
+ * - screenX/screenY are null unless ARCore produced a real, on-screen projection.
+ * - distanceMeters is the horizontal world-space camera -> anchor distance.
+ */
 class ArCoreCameraView @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null
@@ -35,6 +43,8 @@ class ArCoreCameraView @JvmOverloads constructor(
         val distanceMeters: Float?,
         val horizontalAngleDeg: Double?,
         val verticalAngleDeg: Double?,
+        val movementSinceAnchorMeters: Float?,
+        val trackingFailureReason: String,
         val cameraTrackingState: TrackingState
     )
 
@@ -49,6 +59,12 @@ class ArCoreCameraView @JvmOverloads constructor(
     private var displayRotation = 0
     private var pendingAnchor: Pair<Float, Float>? = null
     private var consecutiveTrackingFrames = 0
+    private var anchorOriginCameraTranslation: FloatArray? = null
+
+    // Micro-stabilization is intentionally tiny. It suppresses sub-pixel shimmer only; it must not
+    // turn AR motion into a sticky UI element.
+    private var displayX: Float? = null
+    private var displayY: Float? = null
 
     private val quadVertices = floatArrayOf(-1f,-1f, 1f,-1f, -1f,1f, 1f,1f)
     private val quadBuffer = floatBuffer(quadVertices)
@@ -73,7 +89,13 @@ class ArCoreCameraView @JvmOverloads constructor(
     }
 
     fun detachSession() {
-        queueEvent { targetAnchor?.detach(); targetAnchor = null; pendingAnchor = null }
+        queueEvent {
+            targetAnchor?.detach()
+            targetAnchor = null
+            pendingAnchor = null
+            anchorOriginCameraTranslation = null
+            resetDisplayProjection()
+        }
         consecutiveTrackingFrames = 0
         session = null
     }
@@ -88,7 +110,13 @@ class ArCoreCameraView @JvmOverloads constructor(
     }
 
     fun clearTargetAnchor() {
-        queueEvent { targetAnchor?.detach(); targetAnchor = null; pendingAnchor = null }
+        queueEvent {
+            targetAnchor?.detach()
+            targetAnchor = null
+            pendingAnchor = null
+            anchorOriginCameraTranslation = null
+            resetDisplayProjection()
+        }
     }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
@@ -99,7 +127,8 @@ class ArCoreCameraView @JvmOverloads constructor(
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
-        surfaceWidth = width.coerceAtLeast(1); surfaceHeight = height.coerceAtLeast(1)
+        surfaceWidth = width.coerceAtLeast(1)
+        surfaceHeight = height.coerceAtLeast(1)
         GLES20.glViewport(0,0,surfaceWidth,surfaceHeight)
         session?.setDisplayGeometry(displayRotation,surfaceWidth,surfaceHeight)
     }
@@ -117,11 +146,9 @@ class ArCoreCameraView @JvmOverloads constructor(
                 consecutiveTrackingFrames = (consecutiveTrackingFrames + 1).coerceAtMost(120)
             } else {
                 consecutiveTrackingFrames = 0
+                resetDisplayProjection()
             }
 
-            // Do not create a world anchor on the very first TRACKING frame. During AR session
-            // startup the visual-inertial origin is still converging and an immediate anchor can
-            // appear to shift. ~30 consecutive frames is short to the user but materially steadier.
             if (consecutiveTrackingFrames >= REQUIRED_STABLE_TRACKING_FRAMES) {
                 pendingAnchor?.let { (distance,elevation) ->
                     createAnchorAhead(s, frame, distance, elevation)
@@ -130,7 +157,8 @@ class ArCoreCameraView @JvmOverloads constructor(
             }
             emitFrameState(frame)
         } catch (_: Throwable) {
-            // Session can transition during lifecycle changes; skip this frame.
+            // Session lifecycle can transition while GL is rendering. Skip one frame rather than
+            // publishing invented tracking data.
         }
     }
 
@@ -142,48 +170,136 @@ class ArCoreCameraView @JvmOverloads constructor(
         var fx = -z[0]
         var fz = -z[2]
         val len = sqrt(fx*fx + fz*fz).coerceAtLeast(0.0001f)
-        fx /= len; fz /= len
+        fx /= len
+        fz /= len
         targetAnchor = s.createAnchor(Pose.makeTranslation(
             t[0] + fx * distance,
             t[1] + elevation,
             t[2] + fz * distance
         ))
+        anchorOriginCameraTranslation = t.copyOf()
+        resetDisplayProjection()
     }
 
     private fun emitFrameState(frame: Frame) {
         val camera = frame.camera
         val tracking = camera.trackingState == TrackingState.TRACKING
+        val failureReason = camera.trackingFailureReason.name
         val anchor = targetAnchor
+
         if (!tracking || anchor == null || anchor.trackingState != TrackingState.TRACKING) {
-            post { onFrameState?.invoke(FrameState(
-                tracking, anchor != null, null, null, false, null, null, null, camera.trackingState
-            )) }
+            post {
+                onFrameState?.invoke(
+                    FrameState(
+                        tracking = tracking,
+                        anchorReady = anchor != null,
+                        screenX = null,
+                        screenY = null,
+                        inFront = false,
+                        distanceMeters = null,
+                        horizontalAngleDeg = null,
+                        verticalAngleDeg = null,
+                        movementSinceAnchorMeters = movementSinceAnchor(camera.pose.translation),
+                        trackingFailureReason = failureReason,
+                        cameraTrackingState = camera.trackingState
+                    )
+                )
+            }
             return
         }
 
         val a = anchor.pose.translation
         val ct = camera.pose.translation
-        val dx = a[0]-ct[0]; val dy=a[1]-ct[1]; val dz=a[2]-ct[2]
-        val distance = sqrt(dx*dx + dy*dy + dz*dz)
+        val dx = a[0]-ct[0]
+        val dy = a[1]-ct[1]
+        val dz = a[2]-ct[2]
+        val horizontalDistance = sqrt(dx*dx + dz*dz)
 
         val world = floatArrayOf(a[0],a[1],a[2],1f)
-        val view=FloatArray(16); val projection=FloatArray(16)
-        val cameraSpace=FloatArray(4); val clip=FloatArray(4)
+        val view = FloatArray(16)
+        val projection = FloatArray(16)
+        val cameraSpace = FloatArray(4)
+        val clip = FloatArray(4)
         camera.getViewMatrix(view,0)
         camera.getProjectionMatrix(projection,0,0.05f,250f)
         Matrix.multiplyMV(cameraSpace,0,view,0,world,0)
         Matrix.multiplyMV(clip,0,projection,0,cameraSpace,0)
 
         val inFront = cameraSpace[2] < -0.001f && clip[3] > 0.0001f
-        val x = if(inFront) ((clip[0]/clip[3])+1f)*0.5f else null
-        val y = if(inFront) 1f-(((clip[1]/clip[3])+1f)*0.5f) else null
         val horizontal = Math.toDegrees(atan2(cameraSpace[0].toDouble(), (-cameraSpace[2]).toDouble()))
         val ground = sqrt(cameraSpace[0]*cameraSpace[0] + cameraSpace[2]*cameraSpace[2]).coerceAtLeast(0.0001f)
         val vertical = Math.toDegrees(atan2(cameraSpace[1].toDouble(), ground.toDouble()))
 
-        post { onFrameState?.invoke(FrameState(
-            true,true,x,y,inFront,distance,horizontal,vertical,camera.trackingState
-        )) }
+        var screenX: Float? = null
+        var screenY: Float? = null
+        if (inFront) {
+            val rawX = ((clip[0]/clip[3])+1f)*0.5f
+            val rawY = 1f-(((clip[1]/clip[3])+1f)*0.5f)
+
+            // Never clamp an off-screen point onto the display; that creates the appearance of a
+            // dead marker. If the anchor is outside the camera viewport, compass guidance takes over.
+            if (rawX in -0.02f..1.02f && rawY in -0.02f..1.02f) {
+                val stable = stabilizeProjection(rawX, rawY)
+                screenX = stable.first
+                screenY = stable.second
+            } else {
+                resetDisplayProjection()
+            }
+        } else {
+            resetDisplayProjection()
+        }
+
+        post {
+            onFrameState?.invoke(
+                FrameState(
+                    tracking = true,
+                    anchorReady = true,
+                    screenX = screenX,
+                    screenY = screenY,
+                    inFront = inFront,
+                    distanceMeters = horizontalDistance,
+                    horizontalAngleDeg = horizontal,
+                    verticalAngleDeg = vertical,
+                    movementSinceAnchorMeters = movementSinceAnchor(ct),
+                    trackingFailureReason = failureReason,
+                    cameraTrackingState = camera.trackingState
+                )
+            )
+        }
+    }
+
+    private fun stabilizeProjection(rawX: Float, rawY: Float): Pair<Float, Float> {
+        val px = displayX
+        val py = displayY
+        if (px == null || py == null) {
+            displayX = rawX
+            displayY = rawY
+            return rawX to rawY
+        }
+
+        val delta = hypot((rawX-px).toDouble(), (rawY-py).toDouble()).toFloat()
+        val alpha = when {
+            delta < 0.0012f -> 0f      // roughly one display pixel on common phones
+            delta > 0.045f -> 1f       // real camera movement: follow ARCore immediately
+            delta > 0.015f -> 0.82f
+            else -> 0.58f
+        }
+        displayX = px + (rawX-px)*alpha
+        displayY = py + (rawY-py)*alpha
+        return displayX!! to displayY!!
+    }
+
+    private fun movementSinceAnchor(cameraTranslation: FloatArray): Float? {
+        val origin = anchorOriginCameraTranslation ?: return null
+        val dx = cameraTranslation[0]-origin[0]
+        val dy = cameraTranslation[1]-origin[1]
+        val dz = cameraTranslation[2]-origin[2]
+        return sqrt(dx*dx + dy*dy + dz*dz)
+    }
+
+    private fun resetDisplayProjection() {
+        displayX = null
+        displayY = null
     }
 
     private fun drawCameraBackground(frame: Frame) {
@@ -191,23 +307,32 @@ class ArCoreCameraView @JvmOverloads constructor(
             Coordinates2d.OPENGL_NORMALIZED_DEVICE_COORDINATES, quadVertices,
             Coordinates2d.TEXTURE_NORMALIZED, transformedUv
         )
-        transformedUvBuffer.position(0); transformedUvBuffer.put(transformedUv); transformedUvBuffer.position(0)
+        transformedUvBuffer.position(0)
+        transformedUvBuffer.put(transformedUv)
+        transformedUvBuffer.position(0)
         quadBuffer.position(0)
         GLES20.glDisable(GLES20.GL_DEPTH_TEST)
         GLES20.glUseProgram(program)
-        val pos=GLES20.glGetAttribLocation(program,"a_Position")
-        val uv=GLES20.glGetAttribLocation(program,"a_TexCoord")
-        val texture=GLES20.glGetUniformLocation(program,"u_Texture")
-        GLES20.glEnableVertexAttribArray(pos); GLES20.glVertexAttribPointer(pos,2,GLES20.GL_FLOAT,false,0,quadBuffer)
-        GLES20.glEnableVertexAttribArray(uv); GLES20.glVertexAttribPointer(uv,2,GLES20.GL_FLOAT,false,0,transformedUvBuffer)
-        GLES20.glActiveTexture(GLES20.GL_TEXTURE0); GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,textureId)
-        GLES20.glUniform1i(texture,0); GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP,0,4)
-        GLES20.glDisableVertexAttribArray(pos); GLES20.glDisableVertexAttribArray(uv)
+        val pos = GLES20.glGetAttribLocation(program,"a_Position")
+        val uv = GLES20.glGetAttribLocation(program,"a_TexCoord")
+        val texture = GLES20.glGetUniformLocation(program,"u_Texture")
+        GLES20.glEnableVertexAttribArray(pos)
+        GLES20.glVertexAttribPointer(pos,2,GLES20.GL_FLOAT,false,0,quadBuffer)
+        GLES20.glEnableVertexAttribArray(uv)
+        GLES20.glVertexAttribPointer(uv,2,GLES20.GL_FLOAT,false,0,transformedUvBuffer)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,textureId)
+        GLES20.glUniform1i(texture,0)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP,0,4)
+        GLES20.glDisableVertexAttribArray(pos)
+        GLES20.glDisableVertexAttribArray(uv)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,0)
     }
 
     private fun createExternalTexture(): Int {
-        val ids=IntArray(1); GLES20.glGenTextures(1,ids,0); val id=ids[0]
+        val ids = IntArray(1)
+        GLES20.glGenTextures(1,ids,0)
+        val id = ids[0]
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,id)
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GLES20.GL_TEXTURE_MIN_FILTER,GLES20.GL_LINEAR)
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GLES20.GL_TEXTURE_MAG_FILTER,GLES20.GL_LINEAR)
@@ -216,20 +341,36 @@ class ArCoreCameraView @JvmOverloads constructor(
         return id
     }
 
-    private fun createProgram(v:String,f:String):Int{
-        val vs=compileShader(GLES20.GL_VERTEX_SHADER,v); val fs=compileShader(GLES20.GL_FRAGMENT_SHADER,f)
-        return GLES20.glCreateProgram().also{GLES20.glAttachShader(it,vs);GLES20.glAttachShader(it,fs);GLES20.glLinkProgram(it);GLES20.glDeleteShader(vs);GLES20.glDeleteShader(fs)}
+    private fun createProgram(v:String,f:String):Int {
+        val vs = compileShader(GLES20.GL_VERTEX_SHADER,v)
+        val fs = compileShader(GLES20.GL_FRAGMENT_SHADER,f)
+        return GLES20.glCreateProgram().also {
+            GLES20.glAttachShader(it,vs)
+            GLES20.glAttachShader(it,fs)
+            GLES20.glLinkProgram(it)
+            GLES20.glDeleteShader(vs)
+            GLES20.glDeleteShader(fs)
+        }
     }
-    private fun compileShader(type:Int,source:String):Int=GLES20.glCreateShader(type).also{GLES20.glShaderSource(it,source);GLES20.glCompileShader(it)}
-    private fun floatBuffer(v:FloatArray):FloatBuffer=ByteBuffer.allocateDirect(v.size*4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply{put(v);position(0)}
+
+    private fun compileShader(type:Int,source:String):Int = GLES20.glCreateShader(type).also {
+        GLES20.glShaderSource(it,source)
+        GLES20.glCompileShader(it)
+    }
+
+    private fun floatBuffer(v:FloatArray):FloatBuffer =
+        ByteBuffer.allocateDirect(v.size*4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
+            put(v)
+            position(0)
+        }
 
     companion object {
         private const val REQUIRED_STABLE_TRACKING_FRAMES = 30
-        private const val VERTEX_SHADER="""
+        private const val VERTEX_SHADER = """
             attribute vec4 a_Position; attribute vec2 a_TexCoord; varying vec2 v_TexCoord;
             void main(){ gl_Position=a_Position; v_TexCoord=a_TexCoord; }
         """
-        private const val FRAGMENT_SHADER="""
+        private const val FRAGMENT_SHADER = """
             #extension GL_OES_EGL_image_external : require
             precision mediump float; uniform samplerExternalOES u_Texture; varying vec2 v_TexCoord;
             void main(){ gl_FragColor=texture2D(u_Texture,v_TexCoord); }
