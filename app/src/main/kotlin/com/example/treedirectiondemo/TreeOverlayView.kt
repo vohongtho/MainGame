@@ -11,7 +11,6 @@ import android.view.View
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
-import kotlin.math.tan
 
 class TreeOverlayView @JvmOverloads constructor(
     context: Context,
@@ -19,36 +18,43 @@ class TreeOverlayView @JvmOverloads constructor(
 ) : View(context, attrs) {
 
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private var horizontalDegrees: Double? = null
-    private var verticalDegrees: Double? = null
+
+    private var directionDegrees: Double? = null
     private var distanceMeters: Double? = null
     private var gpsQuality = "WAITING"
     private var ready = false
-    private var targetArea = false
-    private var uncertaintyDegrees = 180.0
-    private var behind = false
+    private var arTracking = false
+    private var arScreenX: Float? = null
+    private var arScreenY: Float? = null
+    private var arInFront = false
+    private var showDistance = true
+    private var showGuidance = true
 
-    private val horizontalFovDegrees = 62.0
-    private val verticalFovDegrees = 46.0
+    private var smoothX: Float? = null
+    private var smoothY: Float? = null
 
     fun updateTarget(
-        horizontalDegrees: Double?,
-        verticalDegrees: Double?,
+        directionDegrees: Double?,
         distanceMeters: Double?,
         gpsQuality: String,
         ready: Boolean,
-        targetArea: Boolean,
-        uncertaintyDegrees: Double,
-        behind: Boolean
+        arTracking: Boolean,
+        arScreenX: Float?,
+        arScreenY: Float?,
+        arInFront: Boolean,
+        showDistance: Boolean,
+        showGuidance: Boolean
     ) {
-        this.horizontalDegrees = horizontalDegrees
-        this.verticalDegrees = verticalDegrees
+        this.directionDegrees = directionDegrees
         this.distanceMeters = distanceMeters
         this.gpsQuality = gpsQuality
         this.ready = ready
-        this.targetArea = targetArea
-        this.uncertaintyDegrees = uncertaintyDegrees
-        this.behind = behind
+        this.arTracking = arTracking
+        this.arScreenX = arScreenX
+        this.arScreenY = arScreenY
+        this.arInFront = arInFront
+        this.showDistance = showDistance
+        this.showGuidance = showGuidance
         invalidate()
     }
 
@@ -57,171 +63,182 @@ class TreeOverlayView @JvmOverloads constructor(
         if (width == 0 || height == 0) return
 
         val cx = width / 2f
-        val cy = height * 0.43f
-        drawReticle(canvas, cx, cy)
+        val reticleY = height * 0.43f
+        drawReticle(canvas, cx, reticleY)
         drawCompassArc(canvas, cx, height * 0.77f)
 
         if (!ready) {
-            drawAcquiring(canvas, cx, cy)
-            return
-        }
-        if (targetArea) {
-            drawTargetArea(canvas, cx, cy)
+            drawAcquiring(canvas, cx, reticleY)
             return
         }
 
-        val h = horizontalDegrees ?: return
-        val v = verticalDegrees ?: 0.0
-        val halfHFov = horizontalFovDegrees / 2.0
-        val halfVFov = verticalFovDegrees / 2.0
+        if (arTracking) {
+            drawArTarget(canvas, cx, reticleY)
+        } else {
+            drawFallbackTarget(canvas, cx, reticleY)
+        }
+    }
 
-        if (behind || abs(h) > 95.0) {
-            drawBehindIndicator(canvas, cx, cy, h)
+    private fun drawArTarget(canvas: Canvas, cx: Float, cy: Float) {
+        val rawX = arScreenX
+        val rawY = arScreenY
+        if (!arInFront || rawX == null || rawY == null) {
+            drawBehindIndicator(canvas, cx, cy)
             return
         }
 
-        val visible = abs(h) <= halfHFov && abs(v) <= halfVFov
-        val xNorm = tan(Math.toRadians(h)) / tan(Math.toRadians(halfHFov))
-        val yNorm = tan(Math.toRadians(v)) / tan(Math.toRadians(halfVFov))
-        val x = (cx + xNorm * cx).toFloat()
-        val usableHalfHeight = height * 0.31f
-        val y = (cy - yNorm * usableHalfHeight).toFloat()
+        // ARCore already performs visual-inertial smoothing. Keep only a tiny display deadband so
+        // sub-pixel pose noise does not shimmer, without introducing the lag of GPS-style filters.
+        val targetX = rawX * width
+        val targetY = rawY * height
+        val previousX = smoothX
+        val previousY = smoothY
+        smoothX = if (previousX == null || abs(targetX - previousX) > 2.5f) {
+            if (previousX == null) targetX else previousX + (targetX - previousX) * 0.72f
+        } else previousX
+        smoothY = if (previousY == null || abs(targetY - previousY) > 2.5f) {
+            if (previousY == null) targetY else previousY + (targetY - previousY) * 0.72f
+        } else previousY
 
-        if (visible) drawVisibleTarget(canvas, x, y, h, v)
-        else drawEdgeIndicator(canvas, x.coerceIn(52f, width - 52f), y.coerceIn(180f, height * 0.68f), h, v)
+        val x = smoothX ?: targetX
+        val y = smoothY ?: targetY
+        val visible = x in -40f..(width + 40f) && y in 120f..(height * 0.70f)
+        if (visible) {
+            drawVisibleTarget(canvas, x.coerceIn(90f, width - 90f), y.coerceIn(190f, height * 0.66f))
+        } else {
+            drawEdgeIndicator(
+                canvas,
+                x.coerceIn(58f, width - 58f),
+                y.coerceIn(180f, height * 0.66f)
+            )
+        }
+    }
+
+    private fun drawFallbackTarget(canvas: Canvas, cx: Float, cy: Float) {
+        val delta = directionDegrees ?: return
+        if (abs(delta) >= 120.0) {
+            drawBehindIndicator(canvas, cx, cy)
+            return
+        }
+        val halfFov = 31.0
+        val visible = abs(delta) <= halfFov
+        val x = if (visible) {
+            (cx + (delta / (halfFov * 2.0)) * width).toFloat()
+        } else if (delta < 0) 58f else width - 58f
+        if (visible) drawVisibleTarget(canvas, x, cy)
+        else drawEdgeIndicator(canvas, x, cy)
     }
 
     private fun accentColor(): Int = when (gpsQuality) {
-        "EXCELLENT", "GOOD" -> Color.rgb(70, 220, 95)
-        "FAIR" -> Color.rgb(255, 177, 38)
+        "EXCELLENT", "GOOD" -> Color.rgb(78, 219, 90)
+        "FAIR" -> Color.rgb(255, 180, 38)
         else -> Color.rgb(244, 73, 65)
     }
 
     private fun drawReticle(canvas: Canvas, cx: Float, cy: Float) {
         paint.style = Paint.Style.STROKE
-        paint.strokeWidth = 2.8f
+        paint.strokeWidth = 2.7f
         paint.color = Color.argb(225, 255, 255, 255)
-        canvas.drawLine(cx - 32f, cy, cx - 8f, cy, paint)
-        canvas.drawLine(cx + 8f, cy, cx + 32f, cy, paint)
-        canvas.drawLine(cx, cy - 32f, cx, cy - 8f, paint)
-        canvas.drawLine(cx, cy + 8f, cx, cy + 32f, paint)
+        canvas.drawLine(cx - 33f, cy, cx - 9f, cy, paint)
+        canvas.drawLine(cx + 9f, cy, cx + 33f, cy, paint)
+        canvas.drawLine(cx, cy - 33f, cx, cy - 9f, paint)
+        canvas.drawLine(cx, cy + 9f, cx, cy + 33f, paint)
     }
 
-    private fun drawVisibleTarget(canvas: Canvas, x: Float, y: Float, h: Double, v: Double) {
+    private fun drawVisibleTarget(canvas: Canvas, x: Float, y: Float) {
         val accent = accentColor()
-        val aligned = abs(h) <= 3.0 && abs(v) <= 3.0
 
         paint.style = Paint.Style.FILL
-        paint.color = Color.argb(218, 4, 12, 8)
-        canvas.drawRoundRect(RectF(x - 76f, y - 102f, x + 76f, y + 100f), 26f, 26f, paint)
+        paint.color = Color.argb(220, 5, 12, 8)
+        canvas.drawRoundRect(RectF(x - 74f, y - 110f, x + 74f, y + 98f), 26f, 26f, paint)
 
-        // Pin
+        // Map-pin silhouette from the approved mockup.
         paint.color = accent
         val pin = Path().apply {
-            moveTo(x, y - 98f)
-            cubicTo(x - 36f, y - 98f, x - 42f, y - 48f, x, y - 18f)
-            cubicTo(x + 42f, y - 48f, x + 36f, y - 98f, x, y - 98f)
+            moveTo(x, y - 108f)
+            cubicTo(x - 36f, y - 108f, x - 42f, y - 58f, x, y - 22f)
+            cubicTo(x + 42f, y - 58f, x + 36f, y - 108f, x, y - 108f)
             close()
         }
         canvas.drawPath(pin, paint)
-        paint.color = Color.rgb(7, 18, 10)
-        canvas.drawCircle(x, y - 70f, 15f, paint)
+        paint.color = Color.rgb(4, 15, 8)
+        canvas.drawCircle(x, y - 78f, 14f, paint)
         paint.color = accent
-        canvas.drawCircle(x, y - 73f, 7f, paint)
-        paint.strokeWidth = 5f
         paint.style = Paint.Style.STROKE
-        canvas.drawOval(RectF(x - 48f, y - 15f, x + 48f, y + 11f), paint)
+        paint.strokeWidth = 5f
+        canvas.drawOval(RectF(x - 48f, y - 16f, x + 48f, y + 10f), paint)
 
         paint.style = Paint.Style.FILL
-        paint.textAlign = Paint.Align.CENTER
-        paint.color = Color.WHITE
-        paint.textSize = 14f
-        paint.isFakeBoldText = true
-        canvas.drawText("TARGET TREE", x, y + 39f, paint)
-        paint.textSize = 29f
-        canvas.drawText(distanceText(), x, y + 76f, paint)
-        paint.isFakeBoldText = false
-
-        if (aligned) {
-            paint.textSize = 12f
-            paint.color = accent
-            paint.isFakeBoldText = true
-            canvas.drawText("ON TARGET", x, y + 96f, paint)
-            paint.isFakeBoldText = false
-        }
-    }
-
-    private fun drawEdgeIndicator(canvas: Canvas, x: Float, y: Float, h: Double, v: Double) {
-        val accent = accentColor()
-        paint.style = Paint.Style.FILL
-        paint.color = Color.argb(220, 4, 12, 8)
-        canvas.drawRoundRect(RectF(x - 58f, y - 44f, x + 58f, y + 44f), 22f, 22f, paint)
-
-        paint.color = accent
-        val path = Path()
-        if (abs(h) > horizontalFovDegrees / 2) {
-            if (h < 0) {
-                path.moveTo(x - 34f, y); path.lineTo(x - 8f, y - 20f); path.lineTo(x - 8f, y + 20f)
-            } else {
-                path.moveTo(x + 34f, y); path.lineTo(x + 8f, y - 20f); path.lineTo(x + 8f, y + 20f)
-            }
-        } else if (v > 0) {
-            path.moveTo(x, y - 28f); path.lineTo(x - 20f, y); path.lineTo(x + 20f, y)
-        } else {
-            path.moveTo(x, y + 28f); path.lineTo(x - 20f, y); path.lineTo(x + 20f, y)
-        }
-        path.close(); canvas.drawPath(path, paint)
-
         paint.textAlign = Paint.Align.CENTER
         paint.color = Color.WHITE
         paint.textSize = 13f
         paint.isFakeBoldText = true
-        canvas.drawText("TREE", x, y + 36f, paint)
+        canvas.drawText("TARGET TREE", x, y + 39f, paint)
+        if (showDistance) {
+            paint.textSize = 29f
+            canvas.drawText(distanceText(), x, y + 76f, paint)
+        }
         paint.isFakeBoldText = false
     }
 
-    private fun drawBehindIndicator(canvas: Canvas, cx: Float, cy: Float, h: Double) {
+    private fun drawEdgeIndicator(canvas: Canvas, x: Float, y: Float) {
+        val accent = accentColor()
         paint.style = Paint.Style.FILL
-        paint.color = Color.argb(220, 4, 12, 8)
-        canvas.drawRoundRect(RectF(cx - 132f, cy - 63f, cx + 132f, cy + 63f), 26f, 26f, paint)
+        paint.color = Color.argb(222, 4, 12, 8)
+        canvas.drawRoundRect(RectF(x - 56f, y - 45f, x + 56f, y + 45f), 22f, 22f, paint)
+        paint.color = accent
+
+        val horizontal = x < 70f || x > width - 70f
+        val path = Path()
+        if (horizontal) {
+            if (x < width / 2f) {
+                path.moveTo(x - 30f, y)
+                path.lineTo(x - 4f, y - 19f)
+                path.lineTo(x - 4f, y + 19f)
+            } else {
+                path.moveTo(x + 30f, y)
+                path.lineTo(x + 4f, y - 19f)
+                path.lineTo(x + 4f, y + 19f)
+            }
+        } else if (y < height / 2f) {
+            path.moveTo(x, y - 27f)
+            path.lineTo(x - 19f, y)
+            path.lineTo(x + 19f, y)
+        } else {
+            path.moveTo(x, y + 27f)
+            path.lineTo(x - 19f, y)
+            path.lineTo(x + 19f, y)
+        }
+        path.close()
+        canvas.drawPath(path, paint)
+
+        paint.textAlign = Paint.Align.CENTER
+        paint.color = Color.WHITE
+        paint.textSize = 12f
+        paint.isFakeBoldText = true
+        canvas.drawText("TREE", x, y + 37f, paint)
+        paint.isFakeBoldText = false
+    }
+
+    private fun drawBehindIndicator(canvas: Canvas, cx: Float, cy: Float) {
+        if (!showGuidance) return
+        paint.style = Paint.Style.FILL
+        paint.color = Color.argb(222, 5, 12, 8)
+        canvas.drawRoundRect(RectF(cx - 135f, cy - 64f, cx + 135f, cy + 64f), 26f, 26f, paint)
         paint.textAlign = Paint.Align.CENTER
         paint.color = Color.rgb(244, 73, 65)
         paint.textSize = 14f
         paint.isFakeBoldText = true
-        canvas.drawText("TREE IS BEHIND YOU", cx, cy - 10f, paint)
-        paint.textSize = 32f
-        canvas.drawText("${abs(h).coerceAtMost(180.0).toInt()}°", cx, cy + 31f, paint)
+        canvas.drawText("TREE IS BEHIND YOU", cx, cy - 8f, paint)
+        paint.textSize = 30f
+        canvas.drawText("TURN AROUND", cx, cy + 31f, paint)
         paint.isFakeBoldText = false
-    }
-
-    private fun drawTargetArea(canvas: Canvas, cx: Float, cy: Float) {
-        val accent = accentColor()
-        paint.style = Paint.Style.FILL
-        paint.color = Color.argb(218, 4, 12, 8)
-        canvas.drawRoundRect(RectF(cx - 132f, cy - 94f, cx + 132f, cy + 94f), 28f, 28f, paint)
-        paint.style = Paint.Style.STROKE
-        paint.strokeWidth = 5f
-        paint.color = accent
-        canvas.drawCircle(cx, cy - 23f, 43f, paint)
-        paint.strokeWidth = 2f
-        paint.color = Color.argb(120, Color.red(accent), Color.green(accent), Color.blue(accent))
-        canvas.drawCircle(cx, cy - 23f, 62f, paint)
-        paint.style = Paint.Style.FILL
-        paint.textAlign = Paint.Align.CENTER
-        paint.color = Color.WHITE
-        paint.textSize = 19f
-        paint.isFakeBoldText = true
-        canvas.drawText("TARGET AREA", cx, cy + 48f, paint)
-        paint.isFakeBoldText = false
-        paint.textSize = 13f
-        paint.color = Color.rgb(205, 225, 212)
-        canvas.drawText("GPS precision limited at close range", cx, cy + 73f, paint)
     }
 
     private fun drawCompassArc(canvas: Canvas, cx: Float, cy: Float) {
         val radius = width * 0.39f
         paint.style = Paint.Style.FILL
-        paint.color = Color.argb(132, 0, 7, 4)
+        paint.color = Color.argb(138, 0, 7, 4)
         canvas.drawOval(RectF(cx - radius, cy - radius * 0.49f, cx + radius, cy + radius * 0.49f), paint)
 
         paint.style = Paint.Style.STROKE
@@ -242,15 +259,18 @@ class TreeOverlayView @JvmOverloads constructor(
             )
         }
 
-        val h = horizontalDegrees ?: 0.0
-        val clamped = h.coerceIn(-60.0, 60.0)
+        val delta = directionDegrees ?: 0.0
+        val clamped = delta.coerceIn(-60.0, 60.0)
         val needleAngle = Math.toRadians((-90 + clamped * 0.72).toDouble())
         paint.style = Paint.Style.FILL
-        paint.color = if (behind) Color.rgb(244, 73, 65) else accentColor()
+        paint.color = if (arTracking && !arInFront) Color.rgb(244, 73, 65) else accentColor()
         val nx = cx + cos(needleAngle).toFloat() * (radius - 23f)
         val ny = cy + sin(needleAngle).toFloat() * (radius - 23f)
         val arrow = Path().apply {
-            moveTo(nx, ny - 14f); lineTo(nx - 9f, ny + 10f); lineTo(nx + 9f, ny + 10f); close()
+            moveTo(nx, ny - 14f)
+            lineTo(nx - 9f, ny + 10f)
+            lineTo(nx + 9f, ny + 10f)
+            close()
         }
         canvas.drawPath(arrow, paint)
 
@@ -263,12 +283,12 @@ class TreeOverlayView @JvmOverloads constructor(
 
     private fun drawAcquiring(canvas: Canvas, cx: Float, cy: Float) {
         paint.style = Paint.Style.FILL
-        paint.color = Color.argb(205, 4, 12, 8)
-        canvas.drawRoundRect(RectF(cx - 152f, cy - 46f, cx + 152f, cy + 46f), 24f, 24f, paint)
+        paint.color = Color.argb(210, 4, 12, 8)
+        canvas.drawRoundRect(RectF(cx - 154f, cy - 46f, cx + 154f, cy + 46f), 24f, 24f, paint)
         paint.textAlign = Paint.Align.CENTER
         paint.textSize = 18f
         paint.color = Color.WHITE
-        canvas.drawText("Acquiring location & heading…", cx, cy + 7f, paint)
+        canvas.drawText("Acquiring AR tracking…", cx, cy + 7f, paint)
     }
 
     private fun distanceText(): String = distanceMeters?.let {
