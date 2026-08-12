@@ -48,6 +48,7 @@ class ArCoreCameraView @JvmOverloads constructor(
     private var surfaceHeight = 1
     private var displayRotation = 0
     private var pendingAnchor: Pair<Float, Float>? = null
+    private var consecutiveTrackingFrames = 0
 
     private val quadVertices = floatArrayOf(-1f,-1f, 1f,-1f, -1f,1f, 1f,1f)
     private val quadBuffer = floatBuffer(quadVertices)
@@ -64,6 +65,7 @@ class ArCoreCameraView @JvmOverloads constructor(
 
     fun attachSession(arSession: Session) {
         session = arSession
+        consecutiveTrackingFrames = 0
         queueEvent {
             if (textureId != -1) arSession.setCameraTextureName(textureId)
             arSession.setDisplayGeometry(displayRotation, surfaceWidth, surfaceHeight)
@@ -72,6 +74,7 @@ class ArCoreCameraView @JvmOverloads constructor(
 
     fun detachSession() {
         queueEvent { targetAnchor?.detach(); targetAnchor = null; pendingAnchor = null }
+        consecutiveTrackingFrames = 0
         session = null
     }
 
@@ -109,7 +112,17 @@ class ArCoreCameraView @JvmOverloads constructor(
             s.setCameraTextureName(textureId)
             val frame = s.update()
             drawCameraBackground(frame)
+
             if (frame.camera.trackingState == TrackingState.TRACKING) {
+                consecutiveTrackingFrames = (consecutiveTrackingFrames + 1).coerceAtMost(120)
+            } else {
+                consecutiveTrackingFrames = 0
+            }
+
+            // Do not create a world anchor on the very first TRACKING frame. During AR session
+            // startup the visual-inertial origin is still converging and an immediate anchor can
+            // appear to shift. ~30 consecutive frames is short to the user but materially steadier.
+            if (consecutiveTrackingFrames >= REQUIRED_STABLE_TRACKING_FRAMES) {
                 pendingAnchor?.let { (distance,elevation) ->
                     createAnchorAhead(s, frame, distance, elevation)
                     pendingAnchor = null
@@ -211,6 +224,7 @@ class ArCoreCameraView @JvmOverloads constructor(
     private fun floatBuffer(v:FloatArray):FloatBuffer=ByteBuffer.allocateDirect(v.size*4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply{put(v);position(0)}
 
     companion object {
+        private const val REQUIRED_STABLE_TRACKING_FRAMES = 30
         private const val VERTEX_SHADER="""
             attribute vec4 a_Position; attribute vec2 a_TexCoord; varying vec2 v_TexCoord;
             void main(){ gl_Position=a_Position; v_TexCoord=a_TexCoord; }
