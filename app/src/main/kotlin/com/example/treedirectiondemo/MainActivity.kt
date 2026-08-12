@@ -28,6 +28,7 @@ import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationResult
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
+import kotlin.math.abs
 import kotlin.math.asin
 import kotlin.math.atan2
 import kotlin.math.cos
@@ -56,14 +57,25 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private val testTreeDistanceMeters = 35.0
 
     private var headingDegrees: Double? = null
+    private var rawHeadingDegrees: Double? = null
     private var rawLocation: Location? = null
     private var effectiveLocation: Location? = null
     private var gpsBearing: Double? = null
+    private var smoothedGpsBearing: Double? = null
+    private var smoothedScreenDelta: Double? = null
     private var distanceToTreeMeters: Float? = null
 
     private var simulateGpsJitter = false
     private var jitterMeters = 6.0
     private var autoTreeCreated = false
+
+    // Tuning values for stability vs responsiveness.
+    private val headingAlpha = 0.08
+    private val headingDeadbandDeg = 1.0
+    private val gpsBearingAlpha = 0.18
+    private val screenDeltaAlpha = 0.14
+    private val screenDeltaDeadbandDeg = 0.7
+    private val maxScreenStepDeg = 2.5
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -123,6 +135,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             treeLng = lng
             setupBearing = etSetupBearing.text.toString().toDoubleOrNull()?.let(BearingMath::normalizeDegrees)
             autoTreeCreated = true
+            smoothedGpsBearing = null
+            smoothedScreenDelta = null
             recomputeGpsGeometry()
             renderState()
         }
@@ -132,6 +146,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             treeLat = null
             treeLng = null
             gpsBearing = null
+            smoothedGpsBearing = null
+            smoothedScreenDelta = null
             distanceToTreeMeters = null
             maybeCreateTestTree(force = true)
             recomputeEffectiveLocation()
@@ -208,10 +224,19 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             Surface.ROTATION_270 -> SensorManager.remapCoordinateSystem(rotation, SensorManager.AXIS_MINUS_Y, SensorManager.AXIS_X, remapped)
         }
         SensorManager.getOrientation(remapped, orientation)
+
         val rawHeading = BearingMath.normalizeDegrees(Math.toDegrees(orientation[0].toDouble()))
+        rawHeadingDegrees = rawHeading
+
         headingDegrees = headingDegrees?.let { prev ->
-            BearingMath.normalizeDegrees(prev + BearingMath.angleDifference(rawHeading, prev) * 0.18)
+            val error = BearingMath.angleDifference(rawHeading, prev)
+            if (abs(error) < headingDeadbandDeg) {
+                prev
+            } else {
+                BearingMath.normalizeDegrees(prev + error * headingAlpha)
+            }
         } ?: rawHeading
+
         maybeCreateTestTree()
         renderState()
     }
@@ -227,6 +252,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         treeLng = dest.second
         setupBearing = bearing
         autoTreeCreated = true
+        smoothedGpsBearing = bearing
+        smoothedScreenDelta = 0.0
         etTreeLat.setText(String.format("%.7f", treeLat))
         etTreeLng.setText(String.format("%.7f", treeLng))
         etSetupBearing.setText(String.format("%.1f", setupBearing))
@@ -256,7 +283,13 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         val loc = effectiveLocation ?: rawLocation ?: return
         val lat = treeLat ?: return
         val lng = treeLng ?: return
-        gpsBearing = BearingMath.bearingDegrees(loc.latitude, loc.longitude, lat, lng)
+
+        val newBearing = BearingMath.bearingDegrees(loc.latitude, loc.longitude, lat, lng)
+        gpsBearing = newBearing
+        smoothedGpsBearing = smoothedGpsBearing?.let { prev ->
+            BearingMath.normalizeDegrees(prev + BearingMath.angleDifference(newBearing, prev) * gpsBearingAlpha)
+        } ?: newBearing
+
         val result = FloatArray(1)
         Location.distanceBetween(loc.latitude, loc.longitude, lat, lng, result)
         distanceToTreeMeters = result[0]
@@ -278,16 +311,32 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private fun renderState() {
         val heading = headingDegrees
-        val target = gpsBearing
-        val delta = if (heading != null && target != null) BearingMath.angleDifference(target, heading) else 0.0
-        overlay.updateDirection(delta, true, "FIXED TREE")
+        val target = smoothedGpsBearing ?: gpsBearing
+        val rawDelta = if (heading != null && target != null) BearingMath.angleDifference(target, heading) else 0.0
+
+        val stableDelta = smoothedScreenDelta?.let { prev ->
+            val error = BearingMath.angleDifference(rawDelta, prev)
+            if (abs(error) < screenDeltaDeadbandDeg) {
+                prev
+            } else {
+                val desiredStep = error * screenDeltaAlpha
+                val limitedStep = desiredStep.coerceIn(-maxScreenStepDeg, maxScreenStepDeg)
+                BearingMath.normalizeSignedDegrees(prev + limitedStep)
+            }
+        } ?: rawDelta
+
+        smoothedScreenDelta = stableDelta
+        overlay.updateDirection(stableDelta, true, "FIXED TREE")
 
         tvDebug.text = buildString {
-            appendLine("MODE: FIXED TREE COORDINATE / LIVE PHONE GPS")
+            appendLine("MODE: FIXED TREE / NOISE FILTERED")
+            appendLine("Raw heading    : ${fmt(rawHeadingDegrees)}°")
             appendLine("Camera heading : ${fmt(heading)}°")
             appendLine("Initial bearing: ${fmt(setupBearing)}°")
-            appendLine("Current bearing: ${fmt(gpsBearing)}°")
-            appendLine("Screen delta   : ${fmt(delta)}°")
+            appendLine("Raw bearing    : ${fmt(gpsBearing)}°")
+            appendLine("Current bearing: ${fmt(target)}°")
+            appendLine("Raw delta      : ${fmt(rawDelta)}°")
+            appendLine("Screen delta   : ${fmt(stableDelta)}°")
             appendLine("Distance       : ${distanceToTreeMeters?.let { String.format("%.1f", it) } ?: "--"} m")
             appendLine("GPS accuracy   : ${rawLocation?.accuracy?.let { String.format("±%.1f", it) } ?: "--"} m")
             appendLine("Phone GPS      : ${locText(effectiveLocation)}")
