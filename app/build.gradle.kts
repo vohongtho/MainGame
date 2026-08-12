@@ -4,7 +4,7 @@ plugins {
 
 android {
     namespace = "com.example.treedirectiondemo"
-    compileSdk = 37
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.example.treedirectiondemo"
@@ -29,8 +29,8 @@ android {
 }
 
 dependencies {
-    implementation("androidx.activity:activity:1.13.0")
-    implementation("androidx.core:core-ktx:1.19.0")
+    implementation("androidx.activity:activity:1.11.0")
+    implementation("androidx.core:core-ktx:1.17.0")
 
     val cameraX = "1.6.1"
     implementation("androidx.camera:camera-core:$cameraX")
