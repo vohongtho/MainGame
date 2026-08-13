@@ -5,12 +5,15 @@ import android.content.Intent
 import android.net.Uri
 
 /**
- * Persistent target identity used by production navigation.
+ * Persistent production target identity.
  *
- * The app can receive a tree from another screen/app using either Intent extras:
- *   TREE_ID, TREE_LAT, TREE_LNG, TREE_TERRAIN_OFFSET_M
- * or a deep link:
+ * Intent extras:
+ *   TREE_ID, TREE_LAT, TREE_LNG, TREE_TERRAIN_OFFSET_M,
+ *   TREE_BLE_ADDRESS, TREE_BLE_ADVERTISED_ID
+ *
+ * Deep link:
  *   treenavigator://navigate?treeId=T123&lat=1.3521&lng=103.8198&offset=0
+ *     &bleAddress=AA:BB:CC:DD:EE:FF&bleId=T123
  */
 class TreeTargetStore(context: Context) {
     data class Target(
@@ -18,7 +21,9 @@ class TreeTargetStore(context: Context) {
         val latitude: Double,
         val longitude: Double,
         val altitudeAboveTerrainM: Double = 0.0,
-        val source: Source = Source.PRODUCTION
+        val source: Source = Source.PRODUCTION,
+        val bleAddress: String? = null,
+        val bleAdvertisedId: String? = null
     ) {
         enum class Source { PRODUCTION, GENERATED_TEST }
 
@@ -40,7 +45,9 @@ class TreeTargetStore(context: Context) {
             altitudeAboveTerrainM = java.lang.Double.longBitsToDouble(prefs.getLong(KEY_OFFSET, 0L)),
             source = runCatching {
                 Target.Source.valueOf(prefs.getString(KEY_SOURCE, Target.Source.PRODUCTION.name)!!)
-            }.getOrDefault(Target.Source.PRODUCTION)
+            }.getOrDefault(Target.Source.PRODUCTION),
+            bleAddress = prefs.getString(KEY_BLE_ADDRESS, null),
+            bleAdvertisedId = prefs.getString(KEY_BLE_ID, null)
         )
         return target.takeIf(Target::isValid)
     }
@@ -54,31 +61,29 @@ class TreeTargetStore(context: Context) {
             .putLong(KEY_LNG, java.lang.Double.doubleToRawLongBits(target.longitude))
             .putLong(KEY_OFFSET, java.lang.Double.doubleToRawLongBits(target.altitudeAboveTerrainM))
             .putString(KEY_SOURCE, target.source.name)
+            .putString(KEY_BLE_ADDRESS, target.bleAddress)
+            .putString(KEY_BLE_ID, target.bleAdvertisedId)
             .apply()
     }
 
     fun clear() {
-        prefs.edit().remove(KEY_HAS_TARGET).remove(KEY_ID).remove(KEY_LAT).remove(KEY_LNG)
-            .remove(KEY_OFFSET).remove(KEY_SOURCE).apply()
+        prefs.edit().clear().apply()
     }
 
     fun fromIntent(intent: Intent?): Target? {
         if (intent == null) return null
-
-        val fromExtras = if (
-            intent.hasExtra(EXTRA_LAT) && intent.hasExtra(EXTRA_LNG)
-        ) {
+        val fromExtras = if (intent.hasExtra(EXTRA_LAT) && intent.hasExtra(EXTRA_LNG)) {
             Target(
                 treeId = intent.getStringExtra(EXTRA_ID)?.ifBlank { null } ?: "TREE",
                 latitude = intent.getDoubleExtra(EXTRA_LAT, Double.NaN),
                 longitude = intent.getDoubleExtra(EXTRA_LNG, Double.NaN),
                 altitudeAboveTerrainM = intent.getDoubleExtra(EXTRA_TERRAIN_OFFSET_M, 0.0),
-                source = Target.Source.PRODUCTION
+                source = Target.Source.PRODUCTION,
+                bleAddress = intent.getStringExtra(EXTRA_BLE_ADDRESS)?.ifBlank { null },
+                bleAdvertisedId = intent.getStringExtra(EXTRA_BLE_ADVERTISED_ID)?.ifBlank { null }
             )
         } else null
-
         if (fromExtras?.isValid() == true) return fromExtras
-
         return fromUri(intent.data)
     }
 
@@ -88,7 +93,10 @@ class TreeTargetStore(context: Context) {
         val lng = uri.getQueryParameter("lng")?.toDoubleOrNull() ?: return null
         val offset = uri.getQueryParameter("offset")?.toDoubleOrNull() ?: 0.0
         val id = uri.getQueryParameter("treeId")?.ifBlank { null } ?: "TREE"
-        return Target(id, lat, lng, offset, Target.Source.PRODUCTION).takeIf(Target::isValid)
+        val bleAddress = uri.getQueryParameter("bleAddress")?.ifBlank { null }
+        val bleId = uri.getQueryParameter("bleId")?.ifBlank { null }
+        return Target(id, lat, lng, offset, Target.Source.PRODUCTION, bleAddress, bleId)
+            .takeIf(Target::isValid)
     }
 
     companion object {
@@ -96,6 +104,8 @@ class TreeTargetStore(context: Context) {
         const val EXTRA_LAT = "TREE_LAT"
         const val EXTRA_LNG = "TREE_LNG"
         const val EXTRA_TERRAIN_OFFSET_M = "TREE_TERRAIN_OFFSET_M"
+        const val EXTRA_BLE_ADDRESS = "TREE_BLE_ADDRESS"
+        const val EXTRA_BLE_ADVERTISED_ID = "TREE_BLE_ADVERTISED_ID"
 
         private const val PREFS = "tree_target_store"
         private const val KEY_HAS_TARGET = "has_target"
@@ -104,5 +114,7 @@ class TreeTargetStore(context: Context) {
         private const val KEY_LNG = "tree_lng"
         private const val KEY_OFFSET = "terrain_offset"
         private const val KEY_SOURCE = "source"
+        private const val KEY_BLE_ADDRESS = "ble_address"
+        private const val KEY_BLE_ID = "ble_advertised_id"
     }
 }
