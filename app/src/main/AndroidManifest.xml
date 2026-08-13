@@ -4,18 +4,20 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <uses-feature android:name="android.hardware.camera" android:required="true" />
     <uses-feature android:name="android.hardware.camera.ar" android:required="true" />
     <uses-feature android:name="android.hardware.sensor.compass" android:required="false" />
 
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:label="Tree Navigator"
         android:supportsRtl="true"
         android:theme="@style/Theme.TreeDirectionDemo">
 
         <meta-data android:name="com.google.ar.core" android:value="required" />
+        <meta-data android:name="com.google.android.ar.API_KEY" android:value="${ARCORE_API_KEY}" />
 
         <activity
             android:name=".MainActivity"
@@ -24,6 +26,14 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- Production integration entry point for another app / portal wrapper. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="treenavigator" android:host="navigate" />
             </intent-filter>
         </activity>
     </application>
