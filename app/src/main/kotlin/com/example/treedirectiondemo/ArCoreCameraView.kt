@@ -8,8 +8,9 @@ import android.opengl.Matrix
 import android.util.AttributeSet
 import com.google.ar.core.Anchor
 import com.google.ar.core.Coordinates2d
+import com.google.ar.core.Earth
 import com.google.ar.core.Frame
-import com.google.ar.core.Pose
+import com.google.ar.core.ResolveAnchorOnTerrainFuture
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
 import java.nio.ByteBuffer
@@ -22,31 +23,45 @@ import kotlin.math.hypot
 import kotlin.math.sqrt
 
 /**
- * ARCore camera + world-anchor projection.
+ * Production AR renderer.
  *
- * Contract:
- * - Target replacement is atomic on the GL thread.
- * - GPS never repositions a locked AR anchor.
- * - screenX/screenY are null unless ARCore produced a real on-screen projection.
- * - distanceMeters is the horizontal camera -> anchor distance in AR world space.
+ * A production tree is represented by a fixed latitude/longitude and resolved through ARCore
+ * Geospatial as a Terrain Anchor. GPS is never used to drag the marker after the anchor resolves.
+ * If Earth localization quality degrades, the marker is withheld until confidence recovers.
  */
 class ArCoreCameraView @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null
 ) : GLSurfaceView(context, attrs), GLSurfaceView.Renderer {
 
+    enum class GeospatialState {
+        DISABLED,
+        PRETRACKING,
+        LOCALIZING,
+        LOCALIZED,
+        UNSUPPORTED,
+        ERROR
+    }
+
     enum class TargetState {
         NONE,
-        REQUESTED,
-        WAITING_FOR_STABLE_TRACKING,
+        WAITING_FOR_GEOSPATIAL,
+        RESOLVING_TERRAIN,
         LOCKED,
-        TRACKING_LOST
+        TRACKING_LOST,
+        ERROR
     }
 
     data class FrameState(
         val tracking: Boolean,
         val anchorReady: Boolean,
         val targetState: TargetState,
+        val geospatialState: GeospatialState,
+        val earthState: String,
+        val geospatialHorizontalAccuracyM: Double?,
+        val geospatialYawAccuracyDeg: Double?,
+        val terrainResolveState: String,
+        val targetError: String?,
         val screenX: Float?,
         val screenY: Float?,
         val inFront: Boolean,
@@ -55,26 +70,38 @@ class ArCoreCameraView @JvmOverloads constructor(
         val verticalAngleDeg: Double?,
         val movementSinceAnchorMeters: Float?,
         val trackingFailureReason: String,
-        val stableTrackingFrames: Int,
         val cameraTrackingState: TrackingState
+    )
+
+    private data class TerrainRequest(
+        val latitude: Double,
+        val longitude: Double,
+        val altitudeAboveTerrainM: Double
     )
 
     var onFrameState: ((FrameState) -> Unit)? = null
 
     private var session: Session? = null
     private var targetAnchor: Anchor? = null
+    private var terrainFuture: ResolveAnchorOnTerrainFuture? = null
+    private var pendingTerrain: TerrainRequest? = null
+
     private var textureId = -1
     private var program = 0
     private var surfaceWidth = 1
     private var surfaceHeight = 1
     private var displayRotation = 0
 
-    // GL-thread owned target request. Never mutate this directly from the Activity thread.
-    private var pendingAnchor: Pair<Float, Float>? = null
-    private var targetState: TargetState = TargetState.NONE
-    private var consecutiveTrackingFrames = 0
+    private var geospatialState = GeospatialState.DISABLED
+    private var earthStateName = "DISABLED"
+    private var horizontalAccuracyM: Double? = null
+    private var yawAccuracyDeg: Double? = null
+    private var targetState = TargetState.NONE
+    private var terrainResolveState = "NONE"
+    private var targetError: String? = null
     private var anchorOriginCameraTranslation: FloatArray? = null
 
+    // Only sub-pixel shimmer is filtered. Real camera movement follows ARCore immediately.
     private var displayX: Float? = null
     private var displayY: Float? = null
 
@@ -94,14 +121,13 @@ class ArCoreCameraView @JvmOverloads constructor(
     fun attachSession(arSession: Session) {
         session = arSession
         queueEvent {
-            consecutiveTrackingFrames = 0
             if (textureId != -1) arSession.setCameraTextureName(textureId)
             arSession.setDisplayGeometry(displayRotation, surfaceWidth, surfaceHeight)
         }
     }
 
     fun detachSession() {
-        queueEvent { resetTargetOnGlThread(TargetState.NONE) }
+        queueEvent { clearTargetOnGlThread() }
         session = null
     }
 
@@ -111,36 +137,49 @@ class ArCoreCameraView @JvmOverloads constructor(
     }
 
     /**
-     * Atomically removes the previous anchor and queues a new target request.
-     * This replaces the old clearTargetAnchor()+placeTargetAhead() sequence, which could race and
-     * delete the new pending request before ARCore ever created it.
+     * Atomically replaces the current production target with a fixed geospatial Terrain Anchor.
+     * Resolution starts only after Earth tracking reaches the localization confidence gate.
      */
-    fun replaceTargetAhead(distanceMeters: Float, elevationOffsetMeters: Float = 0f) {
-        val request = distanceMeters.coerceIn(1f, 150f) to elevationOffsetMeters.coerceIn(-20f,20f)
+    fun replaceTerrainTarget(
+        latitude: Double,
+        longitude: Double,
+        altitudeAboveTerrainM: Double = 0.0
+    ) {
+        require(latitude in -89.9..89.9)
+        require(longitude in -180.0..180.0)
+        val request = TerrainRequest(
+            latitude,
+            longitude,
+            altitudeAboveTerrainM.coerceIn(-20.0, 100.0)
+        )
         queueEvent {
+            terrainFuture?.cancel()
+            terrainFuture = null
             targetAnchor?.detach()
             targetAnchor = null
             anchorOriginCameraTranslation = null
             resetDisplayProjection()
-            pendingAnchor = request
-            targetState = if (consecutiveTrackingFrames >= REQUIRED_STABLE_TRACKING_FRAMES) {
-                TargetState.REQUESTED
-            } else {
-                TargetState.WAITING_FOR_STABLE_TRACKING
-            }
+            pendingTerrain = request
+            targetError = null
+            terrainResolveState = "WAITING"
+            targetState = TargetState.WAITING_FOR_GEOSPATIAL
         }
     }
 
     fun clearTargetAnchor() {
-        queueEvent { resetTargetOnGlThread(TargetState.NONE) }
+        queueEvent { clearTargetOnGlThread() }
     }
 
-    private fun resetTargetOnGlThread(state: TargetState) {
+    private fun clearTargetOnGlThread() {
+        terrainFuture?.cancel()
+        terrainFuture = null
         targetAnchor?.detach()
         targetAnchor = null
-        pendingAnchor = null
+        pendingTerrain = null
         anchorOriginCameraTranslation = null
-        targetState = state
+        targetState = TargetState.NONE
+        terrainResolveState = "NONE"
+        targetError = null
         resetDisplayProjection()
     }
 
@@ -162,75 +201,162 @@ class ArCoreCameraView @JvmOverloads constructor(
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
         val s = session ?: return
         if (textureId == -1) return
+
         try {
             s.setCameraTextureName(textureId)
             val frame = s.update()
             drawCameraBackground(frame)
 
-            val tracking = frame.camera.trackingState == TrackingState.TRACKING
-            if (tracking) {
-                consecutiveTrackingFrames = (consecutiveTrackingFrames + 1).coerceAtMost(300)
-            } else {
-                consecutiveTrackingFrames = 0
-                resetDisplayProjection()
-                if (targetAnchor != null) targetState = TargetState.TRACKING_LOST
-                else if (pendingAnchor != null) targetState = TargetState.WAITING_FOR_STABLE_TRACKING
-            }
-
-            val request = pendingAnchor
-            if (request != null) {
-                targetState = if (consecutiveTrackingFrames >= REQUIRED_STABLE_TRACKING_FRAMES) {
-                    TargetState.REQUESTED
-                } else {
-                    TargetState.WAITING_FOR_STABLE_TRACKING
-                }
-                if (consecutiveTrackingFrames >= REQUIRED_STABLE_TRACKING_FRAMES) {
-                    createAnchorAhead(s, frame, request.first, request.second)
-                    pendingAnchor = null
-                    targetState = TargetState.LOCKED
-                }
-            } else if (targetAnchor != null && tracking && targetAnchor?.trackingState == TrackingState.TRACKING) {
-                targetState = TargetState.LOCKED
-            }
-
+            val earth = runCatching { s.earth }.getOrNull()
+            updateGeospatialState(earth)
+            maybeResolveTerrainAnchor(earth, frame)
+            updateTargetTrackingState(earth, frame)
             emitFrameState(frame)
-        } catch (_: Throwable) {
-            // Do not manufacture tracking data if ARCore is transitioning lifecycle state.
+        } catch (t: Throwable) {
+            targetError = t.javaClass.simpleName
         }
     }
 
-    private fun createAnchorAhead(s: Session, frame: Frame, distance: Float, elevation: Float) {
-        targetAnchor?.detach()
-        val pose = frame.camera.pose
-        val t = pose.translation
-        val z = pose.zAxis
-        var fx = -z[0]
-        var fz = -z[2]
-        val len = sqrt(fx*fx + fz*fz).coerceAtLeast(0.0001f)
-        fx /= len
-        fz /= len
-        targetAnchor = s.createAnchor(Pose.makeTranslation(
-            t[0] + fx * distance,
-            t[1] + elevation,
-            t[2] + fz * distance
-        ))
-        anchorOriginCameraTranslation = t.copyOf()
-        resetDisplayProjection()
+    private fun updateGeospatialState(earth: Earth?) {
+        if (earth == null) {
+            geospatialState = GeospatialState.DISABLED
+            earthStateName = "UNAVAILABLE"
+            horizontalAccuracyM = null
+            yawAccuracyDeg = null
+            return
+        }
+
+        val earthState = earth.earthState
+        earthStateName = earthState.name
+        if (earthState != Earth.EarthState.ENABLED) {
+            geospatialState = GeospatialState.ERROR
+            horizontalAccuracyM = null
+            yawAccuracyDeg = null
+            return
+        }
+
+        if (earth.trackingState != TrackingState.TRACKING) {
+            geospatialState = GeospatialState.PRETRACKING
+            horizontalAccuracyM = null
+            yawAccuracyDeg = null
+            return
+        }
+
+        val pose = runCatching { earth.cameraGeospatialPose }.getOrNull()
+        if (pose == null) {
+            geospatialState = GeospatialState.PRETRACKING
+            horizontalAccuracyM = null
+            yawAccuracyDeg = null
+            return
+        }
+
+        horizontalAccuracyM = pose.horizontalAccuracy
+        yawAccuracyDeg = pose.orientationYawAccuracy
+
+        val h = pose.horizontalAccuracy
+        val y = pose.orientationYawAccuracy
+        geospatialState = if (geospatialState == GeospatialState.LOCALIZED) {
+            if (
+                h <= LOCALIZED_HORIZONTAL_DEGRADE_THRESHOLD_METERS &&
+                y <= LOCALIZED_YAW_DEGRADE_THRESHOLD_DEGREES
+            ) GeospatialState.LOCALIZED else GeospatialState.LOCALIZING
+        } else {
+            if (
+                h <= LOCALIZING_HORIZONTAL_ACCURACY_THRESHOLD_METERS &&
+                y <= LOCALIZING_YAW_ACCURACY_THRESHOLD_DEGREES
+            ) GeospatialState.LOCALIZED else GeospatialState.LOCALIZING
+        }
+    }
+
+    private fun maybeResolveTerrainAnchor(earth: Earth?, frame: Frame) {
+        val request = pendingTerrain ?: return
+
+        if (earth == null || geospatialState != GeospatialState.LOCALIZED) {
+            targetState = TargetState.WAITING_FOR_GEOSPATIAL
+            return
+        }
+        if (terrainFuture != null) {
+            targetState = TargetState.RESOLVING_TERRAIN
+            return
+        }
+
+        targetState = TargetState.RESOLVING_TERRAIN
+        terrainResolveState = "PENDING"
+        targetError = null
+
+        try {
+            val future = earth.resolveAnchorOnTerrainAsync(
+                request.latitude,
+                request.longitude,
+                request.altitudeAboveTerrainM,
+                0f, 0f, 0f, 1f
+            ) { anchor, state ->
+                queueEvent {
+                    terrainFuture = null
+                    terrainResolveState = state.name
+                    if (state == Anchor.TerrainAnchorState.SUCCESS && anchor != null) {
+                        targetAnchor?.detach()
+                        targetAnchor = anchor
+                        pendingTerrain = null
+                        targetState = TargetState.LOCKED
+                        anchorOriginCameraTranslation = frame.camera.pose.translation.copyOf()
+                        targetError = null
+                        resetDisplayProjection()
+                    } else {
+                        anchor?.detach()
+                        targetState = TargetState.ERROR
+                        targetError = state.name
+                    }
+                }
+            }
+            terrainFuture = future
+        } catch (t: Throwable) {
+            targetState = TargetState.ERROR
+            targetError = t.javaClass.simpleName
+            terrainResolveState = "ERROR"
+        }
+    }
+
+    private fun updateTargetTrackingState(earth: Earth?, frame: Frame) {
+        val anchor = targetAnchor ?: return
+        val earthTracking = earth?.trackingState == TrackingState.TRACKING
+        val cameraTracking = frame.camera.trackingState == TrackingState.TRACKING
+        val anchorTracking = anchor.trackingState == TrackingState.TRACKING
+        val localizationGood = geospatialState == GeospatialState.LOCALIZED
+
+        targetState = if (earthTracking && cameraTracking && anchorTracking && localizationGood) {
+            TargetState.LOCKED
+        } else {
+            resetDisplayProjection()
+            TargetState.TRACKING_LOST
+        }
     }
 
     private fun emitFrameState(frame: Frame) {
         val camera = frame.camera
-        val tracking = camera.trackingState == TrackingState.TRACKING
+        val cameraTracking = camera.trackingState == TrackingState.TRACKING
         val failureReason = camera.trackingFailureReason.name
         val anchor = targetAnchor
+        val usable =
+            targetState == TargetState.LOCKED &&
+                geospatialState == GeospatialState.LOCALIZED &&
+                cameraTracking &&
+                anchor != null &&
+                anchor.trackingState == TrackingState.TRACKING
 
-        if (!tracking || anchor == null || anchor.trackingState != TrackingState.TRACKING) {
+        if (!usable || anchor == null) {
             post {
                 onFrameState?.invoke(
                     FrameState(
-                        tracking = tracking,
+                        tracking = cameraTracking,
                         anchorReady = false,
                         targetState = targetState,
+                        geospatialState = geospatialState,
+                        earthState = earthStateName,
+                        geospatialHorizontalAccuracyM = horizontalAccuracyM,
+                        geospatialYawAccuracyDeg = yawAccuracyDeg,
+                        terrainResolveState = terrainResolveState,
+                        targetError = targetError,
                         screenX = null,
                         screenY = null,
                         inFront = false,
@@ -239,7 +365,6 @@ class ArCoreCameraView @JvmOverloads constructor(
                         verticalAngleDeg = null,
                         movementSinceAnchorMeters = movementSinceAnchor(camera.pose.translation),
                         trackingFailureReason = failureReason,
-                        stableTrackingFrames = consecutiveTrackingFrames,
                         cameraTrackingState = camera.trackingState
                     )
                 )
@@ -260,13 +385,17 @@ class ArCoreCameraView @JvmOverloads constructor(
         val cameraSpace = FloatArray(4)
         val clip = FloatArray(4)
         camera.getViewMatrix(view,0)
-        camera.getProjectionMatrix(projection,0,0.05f,250f)
+        camera.getProjectionMatrix(projection,0,0.05f,500f)
         Matrix.multiplyMV(cameraSpace,0,view,0,world,0)
         Matrix.multiplyMV(clip,0,projection,0,cameraSpace,0)
 
         val inFront = cameraSpace[2] < -0.001f && clip[3] > 0.0001f
-        val horizontal = Math.toDegrees(atan2(cameraSpace[0].toDouble(), (-cameraSpace[2]).toDouble()))
-        val ground = sqrt(cameraSpace[0]*cameraSpace[0] + cameraSpace[2]*cameraSpace[2]).coerceAtLeast(0.0001f)
+        val horizontal = Math.toDegrees(
+            atan2(cameraSpace[0].toDouble(), (-cameraSpace[2]).toDouble())
+        )
+        val ground = sqrt(
+            cameraSpace[0]*cameraSpace[0] + cameraSpace[2]*cameraSpace[2]
+        ).coerceAtLeast(0.0001f)
         val vertical = Math.toDegrees(atan2(cameraSpace[1].toDouble(), ground.toDouble()))
 
         var screenX: Float? = null
@@ -291,6 +420,12 @@ class ArCoreCameraView @JvmOverloads constructor(
                     tracking = true,
                     anchorReady = true,
                     targetState = TargetState.LOCKED,
+                    geospatialState = geospatialState,
+                    earthState = earthStateName,
+                    geospatialHorizontalAccuracyM = horizontalAccuracyM,
+                    geospatialYawAccuracyDeg = yawAccuracyDeg,
+                    terrainResolveState = terrainResolveState,
+                    targetError = targetError,
                     screenX = screenX,
                     screenY = screenY,
                     inFront = inFront,
@@ -299,7 +434,6 @@ class ArCoreCameraView @JvmOverloads constructor(
                     verticalAngleDeg = vertical,
                     movementSinceAnchorMeters = movementSinceAnchor(ct),
                     trackingFailureReason = failureReason,
-                    stableTrackingFrames = consecutiveTrackingFrames,
                     cameraTrackingState = camera.trackingState
                 )
             )
@@ -314,6 +448,7 @@ class ArCoreCameraView @JvmOverloads constructor(
             displayY = rawY
             return rawX to rawY
         }
+
         val delta = hypot((rawX-px).toDouble(), (rawY-py).toDouble()).toFloat()
         val alpha = when {
             delta < 0.0012f -> 0f
@@ -348,6 +483,7 @@ class ArCoreCameraView @JvmOverloads constructor(
         transformedUvBuffer.put(transformedUv)
         transformedUvBuffer.position(0)
         quadBuffer.position(0)
+
         GLES20.glDisable(GLES20.GL_DEPTH_TEST)
         GLES20.glUseProgram(program)
         val pos = GLES20.glGetAttribLocation(program,"a_Position")
@@ -402,7 +538,13 @@ class ArCoreCameraView @JvmOverloads constructor(
         }
 
     companion object {
-        private const val REQUIRED_STABLE_TRACKING_FRAMES = 30
+        // Same entry thresholds used by Google's current Geospatial Java sample.
+        private const val LOCALIZING_HORIZONTAL_ACCURACY_THRESHOLD_METERS = 10.0
+        private const val LOCALIZING_YAW_ACCURACY_THRESHOLD_DEGREES = 15.0
+        // Hysteresis prevents rapid LOCALIZED/LOCALIZING flapping.
+        private const val LOCALIZED_HORIZONTAL_DEGRADE_THRESHOLD_METERS = 20.0
+        private const val LOCALIZED_YAW_DEGRADE_THRESHOLD_DEGREES = 25.0
+
         private const val VERTEX_SHADER = """
             attribute vec4 a_Position; attribute vec2 a_TexCoord; varying vec2 v_TexCoord;
             void main(){ gl_Position=a_Position; v_TexCoord=a_TexCoord; }
