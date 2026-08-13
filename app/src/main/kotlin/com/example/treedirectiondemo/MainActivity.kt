@@ -143,7 +143,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sensorManager.unregisterListener(this)
         fusedLocation.removeLocationUpdates(locationCallback)
         if (arRunning) {
-            // GL surface must stop before Session.pause() so it cannot call update() on a paused session.
             arView.onPause()
             arSession?.pause()
             arRunning = false
@@ -218,7 +217,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 val config = Config(s).apply {
                     focusMode = Config.FocusMode.AUTO
                     updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
-                    // Horizontal planes can improve dynamic alignment of terrain anchors on ground.
                     planeFindingMode = Config.PlaneFindingMode.HORIZONTAL
                     lightEstimationMode = Config.LightEstimationMode.DISABLED
                     if (geospatialSupported) geospatialMode = Config.GeospatialMode.ENABLED
@@ -375,10 +373,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         renderUi()
     }
 
-    /**
-     * Creates a generated test target, but resolves it through the exact same Terrain Anchor path
-     * as a production tree. The only difference is where its fixed lat/lng came from.
-     */
     private fun createGeneratedTestTarget(location: Location, heading: Double, distance: Int, elevation: Int) {
         val dest = destinationPoint(location.latitude, location.longitude, heading, distance.toDouble())
         val target = TreeTargetStore.Target(
@@ -461,13 +455,19 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             TreeNavigatorUiView.Action.EXIT -> finish()
             TreeNavigatorUiView.Action.CYCLE_DISTANCE -> {
                 selectedDistance = if (selectedDistance >= 100) 10 else selectedDistance + 5
-                saveSettings(); renderUi()
+                saveSettings()
+                renderUi()
             }
             TreeNavigatorUiView.Action.CYCLE_ELEVATION -> {
                 elevationOffset = when (elevationOffset) {
-                    0 -> 1; 1 -> 2; 2 -> -2; -2 -> -1; else -> 0
+                    0 -> 1
+                    1 -> 2
+                    2 -> -2
+                    -2 -> -1
+                    else -> 0
                 }
-                saveSettings(); renderUi()
+                saveSettings()
+                renderUi()
             }
             TreeNavigatorUiView.Action.CREATE_TARGET -> {
                 val loc = filteredLocation ?: rawLocation
@@ -486,25 +486,37 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 }
             }
             TreeNavigatorUiView.Action.TOGGLE_DISTANCE -> {
-                showDistance = !showDistance; saveSettings(); renderUi()
+                showDistance = !showDistance
+                saveSettings()
+                renderUi()
             }
             TreeNavigatorUiView.Action.TOGGLE_GUIDANCE -> {
-                showGuidance = !showGuidance; saveSettings(); renderUi()
+                showGuidance = !showGuidance
+                saveSettings()
+                renderUi()
             }
             TreeNavigatorUiView.Action.TOGGLE_DECLINATION -> {
-                declinationEnabled = !declinationEnabled; saveSettings(); renderUi()
+                declinationEnabled = !declinationEnabled
+                saveSettings()
+                renderUi()
             }
             TreeNavigatorUiView.Action.CYCLE_HEADING_SMOOTHING -> {
                 headingSmoothing = when (headingSmoothing) {
-                    "Balanced" -> "Stable"; "Stable" -> "Responsive"; else -> "Balanced"
+                    "Balanced" -> "Stable"
+                    "Stable" -> "Responsive"
+                    else -> "Balanced"
                 }
-                saveSettings(); renderUi()
+                saveSettings()
+                renderUi()
             }
             TreeNavigatorUiView.Action.CYCLE_GPS_SMOOTHING -> {
                 gpsSmoothing = when (gpsSmoothing) {
-                    "High" -> "Medium"; "Medium" -> "Low"; else -> "High"
+                    "High" -> "Medium"
+                    "Medium" -> "Low"
+                    else -> "High"
                 }
-                saveSettings(); renderUi()
+                saveSettings()
+                renderUi()
             }
         }
     }
@@ -581,7 +593,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             targetRequested = target != null,
             arTracking = worldLocked,
             arMovementM = arFrame.movementSinceAnchorMeters?.toDouble(),
-            arFailureReason = arFrame.trackingFailureReason,
+            arFailureReason = buildDiagnosticFailureText(),
             selectedDistanceM = selectedDistance,
             elevationOffsetM = elevationOffset,
             showDistance = showDistance,
@@ -600,16 +612,17 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             phoneLng = filteredLocation?.longitude,
             treeLat = target?.latitude,
             treeLng = target?.longitude,
-            arStatus = arStatus,
-            targetId = target?.treeId ?: "--",
-            targetSource = target?.source?.name ?: "NONE",
-            geospatialState = arFrame.geospatialState.name,
-            earthState = arFrame.earthState,
-            geospatialHorizontalAccuracyM = arFrame.geospatialHorizontalAccuracyM,
-            geospatialYawAccuracyDeg = arFrame.geospatialYawAccuracyDeg,
-            terrainResolveState = arFrame.terrainResolveState,
-            apiKeyPresent = BuildConfig.ARCORE_API_KEY_PRESENT
+            arStatus = arStatus
         )
+    }
+
+    private fun buildDiagnosticFailureText(): String {
+        val horizontal = arFrame.geospatialHorizontalAccuracyM?.let { String.format("%.1fm", it) } ?: "--"
+        val yaw = arFrame.geospatialYawAccuracyDeg?.let { String.format("%.1f°", it) } ?: "--"
+        val auth = if (BuildConfig.ARCORE_API_KEY_PRESENT) "KEY" else "KEYLESS/UNCONFIGURED"
+        return "cam=${arFrame.trackingFailureReason}; earth=${arFrame.earthState}; " +
+            "geo=${arFrame.geospatialState.name}; h=$horizontal; yaw=$yaw; " +
+            "terrain=${arFrame.terrainResolveState}; auth=$auth; target=${arFrame.targetError ?: "OK"}"
     }
 
     private fun loadSettings() {
