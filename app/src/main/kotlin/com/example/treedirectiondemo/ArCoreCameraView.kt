@@ -24,19 +24,29 @@ import kotlin.math.sqrt
 /**
  * ARCore camera + world-anchor projection.
  *
- * Important contract:
- * - GPS never repositions the AR anchor.
- * - screenX/screenY are null unless ARCore produced a real, on-screen projection.
- * - distanceMeters is the horizontal world-space camera -> anchor distance.
+ * Contract:
+ * - Target replacement is atomic on the GL thread.
+ * - GPS never repositions a locked AR anchor.
+ * - screenX/screenY are null unless ARCore produced a real on-screen projection.
+ * - distanceMeters is the horizontal camera -> anchor distance in AR world space.
  */
 class ArCoreCameraView @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null
 ) : GLSurfaceView(context, attrs), GLSurfaceView.Renderer {
 
+    enum class TargetState {
+        NONE,
+        REQUESTED,
+        WAITING_FOR_STABLE_TRACKING,
+        LOCKED,
+        TRACKING_LOST
+    }
+
     data class FrameState(
         val tracking: Boolean,
         val anchorReady: Boolean,
+        val targetState: TargetState,
         val screenX: Float?,
         val screenY: Float?,
         val inFront: Boolean,
@@ -45,6 +55,7 @@ class ArCoreCameraView @JvmOverloads constructor(
         val verticalAngleDeg: Double?,
         val movementSinceAnchorMeters: Float?,
         val trackingFailureReason: String,
+        val stableTrackingFrames: Int,
         val cameraTrackingState: TrackingState
     )
 
@@ -57,12 +68,13 @@ class ArCoreCameraView @JvmOverloads constructor(
     private var surfaceWidth = 1
     private var surfaceHeight = 1
     private var displayRotation = 0
+
+    // GL-thread owned target request. Never mutate this directly from the Activity thread.
     private var pendingAnchor: Pair<Float, Float>? = null
+    private var targetState: TargetState = TargetState.NONE
     private var consecutiveTrackingFrames = 0
     private var anchorOriginCameraTranslation: FloatArray? = null
 
-    // Micro-stabilization is intentionally tiny. It suppresses sub-pixel shimmer only; it must not
-    // turn AR motion into a sticky UI element.
     private var displayX: Float? = null
     private var displayY: Float? = null
 
@@ -81,22 +93,15 @@ class ArCoreCameraView @JvmOverloads constructor(
 
     fun attachSession(arSession: Session) {
         session = arSession
-        consecutiveTrackingFrames = 0
         queueEvent {
+            consecutiveTrackingFrames = 0
             if (textureId != -1) arSession.setCameraTextureName(textureId)
             arSession.setDisplayGeometry(displayRotation, surfaceWidth, surfaceHeight)
         }
     }
 
     fun detachSession() {
-        queueEvent {
-            targetAnchor?.detach()
-            targetAnchor = null
-            pendingAnchor = null
-            anchorOriginCameraTranslation = null
-            resetDisplayProjection()
-        }
-        consecutiveTrackingFrames = 0
+        queueEvent { resetTargetOnGlThread(TargetState.NONE) }
         session = null
     }
 
@@ -105,18 +110,38 @@ class ArCoreCameraView @JvmOverloads constructor(
         queueEvent { session?.setDisplayGeometry(rotation, surfaceWidth, surfaceHeight) }
     }
 
-    fun placeTargetAhead(distanceMeters: Float, elevationOffsetMeters: Float = 0f) {
-        pendingAnchor = distanceMeters.coerceIn(1f, 150f) to elevationOffsetMeters.coerceIn(-20f,20f)
-    }
-
-    fun clearTargetAnchor() {
+    /**
+     * Atomically removes the previous anchor and queues a new target request.
+     * This replaces the old clearTargetAnchor()+placeTargetAhead() sequence, which could race and
+     * delete the new pending request before ARCore ever created it.
+     */
+    fun replaceTargetAhead(distanceMeters: Float, elevationOffsetMeters: Float = 0f) {
+        val request = distanceMeters.coerceIn(1f, 150f) to elevationOffsetMeters.coerceIn(-20f,20f)
         queueEvent {
             targetAnchor?.detach()
             targetAnchor = null
-            pendingAnchor = null
             anchorOriginCameraTranslation = null
             resetDisplayProjection()
+            pendingAnchor = request
+            targetState = if (consecutiveTrackingFrames >= REQUIRED_STABLE_TRACKING_FRAMES) {
+                TargetState.REQUESTED
+            } else {
+                TargetState.WAITING_FOR_STABLE_TRACKING
+            }
         }
+    }
+
+    fun clearTargetAnchor() {
+        queueEvent { resetTargetOnGlThread(TargetState.NONE) }
+    }
+
+    private fun resetTargetOnGlThread(state: TargetState) {
+        targetAnchor?.detach()
+        targetAnchor = null
+        pendingAnchor = null
+        anchorOriginCameraTranslation = null
+        targetState = state
+        resetDisplayProjection()
     }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
@@ -142,23 +167,35 @@ class ArCoreCameraView @JvmOverloads constructor(
             val frame = s.update()
             drawCameraBackground(frame)
 
-            if (frame.camera.trackingState == TrackingState.TRACKING) {
-                consecutiveTrackingFrames = (consecutiveTrackingFrames + 1).coerceAtMost(120)
+            val tracking = frame.camera.trackingState == TrackingState.TRACKING
+            if (tracking) {
+                consecutiveTrackingFrames = (consecutiveTrackingFrames + 1).coerceAtMost(300)
             } else {
                 consecutiveTrackingFrames = 0
                 resetDisplayProjection()
+                if (targetAnchor != null) targetState = TargetState.TRACKING_LOST
+                else if (pendingAnchor != null) targetState = TargetState.WAITING_FOR_STABLE_TRACKING
             }
 
-            if (consecutiveTrackingFrames >= REQUIRED_STABLE_TRACKING_FRAMES) {
-                pendingAnchor?.let { (distance,elevation) ->
-                    createAnchorAhead(s, frame, distance, elevation)
-                    pendingAnchor = null
+            val request = pendingAnchor
+            if (request != null) {
+                targetState = if (consecutiveTrackingFrames >= REQUIRED_STABLE_TRACKING_FRAMES) {
+                    TargetState.REQUESTED
+                } else {
+                    TargetState.WAITING_FOR_STABLE_TRACKING
                 }
+                if (consecutiveTrackingFrames >= REQUIRED_STABLE_TRACKING_FRAMES) {
+                    createAnchorAhead(s, frame, request.first, request.second)
+                    pendingAnchor = null
+                    targetState = TargetState.LOCKED
+                }
+            } else if (targetAnchor != null && tracking && targetAnchor?.trackingState == TrackingState.TRACKING) {
+                targetState = TargetState.LOCKED
             }
+
             emitFrameState(frame)
         } catch (_: Throwable) {
-            // Session lifecycle can transition while GL is rendering. Skip one frame rather than
-            // publishing invented tracking data.
+            // Do not manufacture tracking data if ARCore is transitioning lifecycle state.
         }
     }
 
@@ -192,7 +229,8 @@ class ArCoreCameraView @JvmOverloads constructor(
                 onFrameState?.invoke(
                     FrameState(
                         tracking = tracking,
-                        anchorReady = anchor != null,
+                        anchorReady = false,
+                        targetState = targetState,
                         screenX = null,
                         screenY = null,
                         inFront = false,
@@ -201,6 +239,7 @@ class ArCoreCameraView @JvmOverloads constructor(
                         verticalAngleDeg = null,
                         movementSinceAnchorMeters = movementSinceAnchor(camera.pose.translation),
                         trackingFailureReason = failureReason,
+                        stableTrackingFrames = consecutiveTrackingFrames,
                         cameraTrackingState = camera.trackingState
                     )
                 )
@@ -235,9 +274,6 @@ class ArCoreCameraView @JvmOverloads constructor(
         if (inFront) {
             val rawX = ((clip[0]/clip[3])+1f)*0.5f
             val rawY = 1f-(((clip[1]/clip[3])+1f)*0.5f)
-
-            // Never clamp an off-screen point onto the display; that creates the appearance of a
-            // dead marker. If the anchor is outside the camera viewport, compass guidance takes over.
             if (rawX in -0.02f..1.02f && rawY in -0.02f..1.02f) {
                 val stable = stabilizeProjection(rawX, rawY)
                 screenX = stable.first
@@ -254,6 +290,7 @@ class ArCoreCameraView @JvmOverloads constructor(
                 FrameState(
                     tracking = true,
                     anchorReady = true,
+                    targetState = TargetState.LOCKED,
                     screenX = screenX,
                     screenY = screenY,
                     inFront = inFront,
@@ -262,6 +299,7 @@ class ArCoreCameraView @JvmOverloads constructor(
                     verticalAngleDeg = vertical,
                     movementSinceAnchorMeters = movementSinceAnchor(ct),
                     trackingFailureReason = failureReason,
+                    stableTrackingFrames = consecutiveTrackingFrames,
                     cameraTrackingState = camera.trackingState
                 )
             )
@@ -276,11 +314,10 @@ class ArCoreCameraView @JvmOverloads constructor(
             displayY = rawY
             return rawX to rawY
         }
-
         val delta = hypot((rawX-px).toDouble(), (rawY-py).toDouble()).toFloat()
         val alpha = when {
-            delta < 0.0012f -> 0f      // roughly one display pixel on common phones
-            delta > 0.045f -> 1f       // real camera movement: follow ARCore immediately
+            delta < 0.0012f -> 0f
+            delta > 0.045f -> 1f
             delta > 0.015f -> 0.82f
             else -> 0.58f
         }
