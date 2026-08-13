@@ -10,15 +10,30 @@ android {
         applicationId = "com.example.treedirectiondemo"
         minSdk = 26
         targetSdk = 36
-        versionCode = 2
-        versionName = "2.0"
+        versionCode = 3
+        versionName = "3.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // The Geospatial API may use either keyless authorization or an API key. For API-key
+        // authorization CI/prod should provide ARCORE_API_KEY as an environment variable/secret.
+        // Keeping a placeholder lets keyless-authorized builds compile without committing secrets.
+        val arcoreApiKey = System.getenv("ARCORE_API_KEY")?.takeIf { it.isNotBlank() } ?: "UNCONFIGURED"
+        manifestPlaceholders["ARCORE_API_KEY"] = arcoreApiKey
+        buildConfigField("boolean", "ARCORE_API_KEY_PRESENT", (arcoreApiKey != "UNCONFIGURED").toString())
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
         }
     }
 
