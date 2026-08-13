@@ -40,6 +40,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private val sensorManager by lazy { getSystemService(SENSOR_SERVICE) as SensorManager }
     private val fusedLocation by lazy { LocationServices.getFusedLocationProviderClient(this) }
+    private val prefs by lazy { getSharedPreferences("tree_navigator", MODE_PRIVATE) }
 
     private var arSession: Session? = null
     private var arRunning = false
@@ -47,6 +48,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var arFrame = ArCoreCameraView.FrameState(
         tracking = false,
         anchorReady = false,
+        targetState = ArCoreCameraView.TargetState.NONE,
         screenX = null,
         screenY = null,
         inFront = false,
@@ -55,12 +57,10 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         verticalAngleDeg = null,
         movementSinceAnchorMeters = null,
         trackingFailureReason = "NONE",
+        stableTrackingFrames = 0,
         cameraTrackingState = TrackingState.PAUSED
     )
-
-    // AR values are allowed to freeze briefly across a tracking pause, but are never replaced by GPS.
-    private var lastGoodArDistance: Double? = null
-    private var lastGoodArDirection: Double? = null
+    private var previousTargetState = ArCoreCameraView.TargetState.NONE
 
     private var rawLocation: Location? = null
     private var filteredLocation: Location? = null
@@ -106,6 +106,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        loadSettings()
         setContentView(R.layout.activity_main)
 
         arView = findViewById(R.id.arView)
@@ -114,10 +115,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         arView.setDisplayRotation(display?.rotation ?: Surface.ROTATION_0)
         arView.onFrameState = { frame ->
             arFrame = frame
-            if (frame.tracking && frame.anchorReady) {
-                frame.distanceMeters?.let { lastGoodArDistance = it.toDouble() }
-                frame.horizontalAngleDeg?.let { lastGoodArDirection = it }
-            }
+            handleTargetStateTransition(frame.targetState)
             maybeAutoCreateTarget()
             renderUi()
         }
@@ -150,6 +148,20 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         arView.detachSession()
         arSession?.close()
         arSession = null
+    }
+
+    private fun handleTargetStateTransition(newState: ArCoreCameraView.TargetState) {
+        if (newState == previousTargetState) return
+        when (newState) {
+            ArCoreCameraView.TargetState.LOCKED -> toast("Target tree is world locked")
+            ArCoreCameraView.TargetState.TRACKING_LOST -> {
+                if (previousTargetState == ArCoreCameraView.TargetState.LOCKED) {
+                    toast("AR tracking lost — keep the camera on textured surroundings")
+                }
+            }
+            else -> Unit
+        }
+        previousTargetState = newState
     }
 
     private fun requestPermissionsIfNeeded() {
@@ -346,10 +358,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         treeLng = dest.second
         gpsBearing = heading
         filteredBearing = heading
-        lastGoodArDistance = null
-        lastGoodArDirection = null
-        arView.clearTargetAnchor()
-        arView.placeTargetAhead(distance.toFloat(), elevation.toFloat())
+        previousTargetState = ArCoreCameraView.TargetState.NONE
+        arView.replaceTargetAhead(distance.toFloat(), elevation.toFloat())
         recomputeGlobalGeometry()
     }
 
@@ -386,6 +396,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             TreeNavigatorUiView.Action.EXIT -> finish()
             TreeNavigatorUiView.Action.CYCLE_DISTANCE -> {
                 selectedDistance = if (selectedDistance >= 100) 10 else selectedDistance + 5
+                saveSettings()
                 renderUi()
             }
             TreeNavigatorUiView.Action.CYCLE_ELEVATION -> {
@@ -396,30 +407,38 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     -2 -> -1
                     else -> 0
                 }
+                saveSettings()
                 renderUi()
             }
             TreeNavigatorUiView.Action.CREATE_TARGET -> {
                 val loc = filteredLocation ?: rawLocation
                 val heading = filteredHeading ?: trueHeading
-                if (loc == null || heading == null || !arFrame.tracking) {
-                    toast("Wait for GPS, heading and AR tracking")
+                if (loc == null) {
+                    toast("Waiting for an accurate GPS position")
+                } else if (heading == null) {
+                    toast("Waiting for heading sensor")
+                } else if (!arFrame.tracking) {
+                    toast("Move the phone slowly until AR tracking is ready")
                 } else {
                     createTarget(loc, heading, selectedDistance, elevationOffset)
                     autoTargetPending = false
                     uiView.screen = TreeNavigatorUiView.Screen.HOME
-                    toast("Locking target ${selectedDistance} m ahead…")
+                    toast("Creating target…")
                 }
             }
             TreeNavigatorUiView.Action.TOGGLE_DISTANCE -> {
                 showDistance = !showDistance
+                saveSettings()
                 renderUi()
             }
             TreeNavigatorUiView.Action.TOGGLE_GUIDANCE -> {
                 showGuidance = !showGuidance
+                saveSettings()
                 renderUi()
             }
             TreeNavigatorUiView.Action.TOGGLE_DECLINATION -> {
                 declinationEnabled = !declinationEnabled
+                saveSettings()
                 renderUi()
             }
             TreeNavigatorUiView.Action.CYCLE_HEADING_SMOOTHING -> {
@@ -428,6 +447,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     "Stable" -> "Responsive"
                     else -> "Balanced"
                 }
+                saveSettings()
                 renderUi()
             }
             TreeNavigatorUiView.Action.CYCLE_GPS_SMOOTHING -> {
@@ -436,6 +456,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     "Medium" -> "Low"
                     else -> "High"
                 }
+                saveSettings()
                 renderUi()
             }
         }
@@ -457,24 +478,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             BearingMath.angleDifference(filteredBearing!!, heading)
         } else null
 
-        val anchorExists = arFrame.anchorReady
-        val arTrackingTarget = anchorExists && arFrame.tracking
-
-        // After the AR anchor exists, AR camera-space is authoritative. GPS is never substituted
-        // into the main marker/distance contract.
-        val direction = if (arTrackingTarget) {
-            arFrame.horizontalAngleDeg ?: lastGoodArDirection
-        } else if (!anchorExists) {
-            fallbackDelta
-        } else {
-            lastGoodArDirection
-        }
-
-        val arDistance = if (arTrackingTarget) {
-            arFrame.distanceMeters?.toDouble() ?: lastGoodArDistance
-        } else if (anchorExists) {
-            lastGoodArDistance
-        } else null
+        val worldLocked = arFrame.targetState == ArCoreCameraView.TargetState.LOCKED && arFrame.tracking && arFrame.anchorReady
+        val direction = if (worldLocked) arFrame.horizontalAngleDeg else fallbackDelta
+        val arDistance = if (worldLocked) arFrame.distanceMeters?.toDouble() else null
 
         val globalDistance = filteredLocation?.let { loc ->
             val lat = treeLat
@@ -499,14 +505,17 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             else -> "WAITING"
         }
 
-        val arStatus = when {
-            arTrackingTarget && arFrame.screenX != null && arFrame.screenY != null -> "WORLD LOCKED"
-            arTrackingTarget && !arFrame.inFront -> "TARGET BEHIND"
-            arTrackingTarget -> "TARGET OFF SCREEN"
-            anchorExists -> "TRACKING PAUSED"
-            treeLat != null -> "LOCKING TARGET"
-            arFrame.tracking -> "READY TO LOCK"
-            else -> "ACQUIRING"
+        val arStatus = when (arFrame.targetState) {
+            ArCoreCameraView.TargetState.NONE -> if (arFrame.tracking) "READY TO CREATE" else "ACQUIRING"
+            ArCoreCameraView.TargetState.REQUESTED -> "CREATING TARGET"
+            ArCoreCameraView.TargetState.WAITING_FOR_STABLE_TRACKING -> "WAITING FOR STABLE TRACKING"
+            ArCoreCameraView.TargetState.LOCKED -> when {
+                !arFrame.tracking -> "TRACKING LOST"
+                !arFrame.inFront -> "TARGET BEHIND"
+                arFrame.screenX == null || arFrame.screenY == null -> "TARGET OFF SCREEN"
+                else -> "WORLD LOCKED"
+            }
+            ArCoreCameraView.TargetState.TRACKING_LOST -> "TRACKING LOST"
         }
 
         uiView.model = TreeNavigatorUiView.Model(
@@ -517,12 +526,12 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             targetDistanceM = arDistance,
             gpsDistanceM = globalDistance,
             directionDeltaDeg = direction,
-            targetScreenX = if (arTrackingTarget) arFrame.screenX else null,
-            targetScreenY = if (arTrackingTarget) arFrame.screenY else null,
-            targetInFront = arTrackingTarget && arFrame.inFront,
-            targetReady = anchorExists,
+            targetScreenX = if (worldLocked) arFrame.screenX else null,
+            targetScreenY = if (worldLocked) arFrame.screenY else null,
+            targetInFront = worldLocked && arFrame.inFront,
+            targetReady = worldLocked,
             targetRequested = treeLat != null,
-            arTracking = arTrackingTarget,
+            arTracking = worldLocked,
             arMovementM = arFrame.movementSinceAnchorMeters?.toDouble(),
             arFailureReason = arFrame.trackingFailureReason,
             selectedDistanceM = selectedDistance,
@@ -545,6 +554,28 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             treeLng = treeLng,
             arStatus = arStatus
         )
+    }
+
+    private fun loadSettings() {
+        selectedDistance = prefs.getInt("selected_distance", 35).coerceIn(10, 100)
+        elevationOffset = prefs.getInt("elevation_offset", 0).coerceIn(-2, 2)
+        showDistance = prefs.getBoolean("show_distance", true)
+        showGuidance = prefs.getBoolean("show_guidance", true)
+        declinationEnabled = prefs.getBoolean("declination", true)
+        headingSmoothing = prefs.getString("heading_smoothing", "Balanced") ?: "Balanced"
+        gpsSmoothing = prefs.getString("gps_smoothing", "High") ?: "High"
+    }
+
+    private fun saveSettings() {
+        prefs.edit()
+            .putInt("selected_distance", selectedDistance)
+            .putInt("elevation_offset", elevationOffset)
+            .putBoolean("show_distance", showDistance)
+            .putBoolean("show_guidance", showGuidance)
+            .putBoolean("declination", declinationEnabled)
+            .putString("heading_smoothing", headingSmoothing)
+            .putString("gps_smoothing", gpsSmoothing)
+            .apply()
     }
 
     private fun destinationPoint(
