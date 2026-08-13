@@ -2,6 +2,8 @@ package com.example.treedirectiondemo
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.AlertDialog
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.hardware.GeomagneticField
 import android.hardware.Sensor
@@ -41,26 +43,18 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private val sensorManager by lazy { getSystemService(SENSOR_SERVICE) as SensorManager }
     private val fusedLocation by lazy { LocationServices.getFusedLocationProviderClient(this) }
     private val prefs by lazy { getSharedPreferences("tree_navigator", MODE_PRIVATE) }
+    private val targetStore by lazy { TreeTargetStore(this) }
 
     private var arSession: Session? = null
     private var arRunning = false
     private var installRequested = false
-    private var arFrame = ArCoreCameraView.FrameState(
-        tracking = false,
-        anchorReady = false,
-        targetState = ArCoreCameraView.TargetState.NONE,
-        screenX = null,
-        screenY = null,
-        inFront = false,
-        distanceMeters = null,
-        horizontalAngleDeg = null,
-        verticalAngleDeg = null,
-        movementSinceAnchorMeters = null,
-        trackingFailureReason = "NONE",
-        stableTrackingFrames = 0,
-        cameraTrackingState = TrackingState.PAUSED
-    )
+    private var geospatialSupported = true
+
+    private var arFrame = emptyArFrame()
     private var previousTargetState = ArCoreCameraView.TargetState.NONE
+
+    private var activeTarget: TreeTargetStore.Target? = null
+    private var targetResolutionRequested = false
 
     private var rawLocation: Location? = null
     private var filteredLocation: Location? = null
@@ -78,12 +72,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var previousGameYaw: Double? = null
     private var previousGameTimestamp = 0L
 
-    private var treeLat: Double? = null
-    private var treeLng: Double? = null
     private var selectedDistance = 35
     private var elevationOffset = 0
-    private var autoTargetPending = true
-
     private var showDistance = true
     private var showGuidance = true
     private var declinationEnabled = true
@@ -94,8 +84,12 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
-        if (hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)) startLocationUpdates()
-        if (hasPermission(Manifest.permission.CAMERA)) ensureArSession()
+        if (!hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)) {
+            toast("Precise location is required for Geospatial navigation")
+            renderUi()
+            return@registerForActivityResult
+        }
+        startProductionServices()
     }
 
     private val locationCallback = object : LocationCallback() {
@@ -107,29 +101,41 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         loadSettings()
+        activeTarget = targetStore.fromIntent(intent)?.also(targetStore::save) ?: targetStore.load()
         setContentView(R.layout.activity_main)
 
         arView = findViewById(R.id.arView)
         uiView = findViewById(R.id.uiView)
-
         arView.setDisplayRotation(display?.rotation ?: Surface.ROTATION_0)
         arView.onFrameState = { frame ->
             arFrame = frame
             handleTargetStateTransition(frame.targetState)
-            maybeAutoCreateTarget()
             renderUi()
         }
         uiView.onAction = ::handleUiAction
 
-        requestPermissionsIfNeeded()
+        if (hasGeospatialConsent()) {
+            requestPermissionsIfNeededOrStart()
+        } else {
+            showGeospatialConsent()
+        }
         renderUi()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        targetStore.fromIntent(intent)?.let { target ->
+            setProductionTarget(target)
+            toast("Tree ${target.treeId} loaded")
+        }
     }
 
     override fun onResume() {
         super.onResume()
-        registerSensors()
-        if (hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)) startLocationUpdates()
-        if (hasPermission(Manifest.permission.CAMERA)) ensureArSession()
+        if (hasGeospatialConsent() && hasRequiredPermissions()) {
+            startProductionServices()
+        }
     }
 
     override fun onPause() {
@@ -137,6 +143,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sensorManager.unregisterListener(this)
         fusedLocation.removeLocationUpdates(locationCallback)
         if (arRunning) {
+            // GL surface must stop before Session.pause() so it cannot call update() on a paused session.
             arView.onPause()
             arSession?.pause()
             arRunning = false
@@ -150,33 +157,49 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         arSession = null
     }
 
-    private fun handleTargetStateTransition(newState: ArCoreCameraView.TargetState) {
-        if (newState == previousTargetState) return
-        when (newState) {
-            ArCoreCameraView.TargetState.LOCKED -> toast("Target tree is world locked")
-            ArCoreCameraView.TargetState.TRACKING_LOST -> {
-                if (previousTargetState == ArCoreCameraView.TargetState.LOCKED) {
-                    toast("AR tracking lost — keep the camera on textured surroundings")
-                }
+    private fun hasGeospatialConsent(): Boolean = prefs.getBoolean(KEY_GEOSPATIAL_CONSENT, false)
+
+    private fun showGeospatialConsent() {
+        AlertDialog.Builder(this)
+            .setTitle("AR navigation data use")
+            .setMessage(
+                "Tree Navigator uses your camera and precise location to resolve real-world tree positions. " +
+                    "This application runs on Google Play Services for AR (ARCore), which is provided by " +
+                    "Google LLC and governed by the Google Privacy Policy.\n\n" +
+                    "Continue only if you agree to use these device data for AR navigation."
+            )
+            .setCancelable(false)
+            .setPositiveButton("CONTINUE") { _, _ ->
+                prefs.edit().putBoolean(KEY_GEOSPATIAL_CONSENT, true).apply()
+                requestPermissionsIfNeededOrStart()
             }
-            else -> Unit
-        }
-        previousTargetState = newState
+            .setNegativeButton("EXIT") { _, _ -> finish() }
+            .show()
     }
 
-    private fun requestPermissionsIfNeeded() {
+    private fun requestPermissionsIfNeededOrStart() {
         val needed = mutableListOf<String>()
         if (!hasPermission(Manifest.permission.CAMERA)) needed += Manifest.permission.CAMERA
         if (!hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)) needed += Manifest.permission.ACCESS_FINE_LOCATION
         if (!hasPermission(Manifest.permission.ACCESS_COARSE_LOCATION)) needed += Manifest.permission.ACCESS_COARSE_LOCATION
         if (needed.isNotEmpty()) permissionLauncher.launch(needed.toTypedArray())
+        else startProductionServices()
     }
+
+    private fun hasRequiredPermissions(): Boolean =
+        hasPermission(Manifest.permission.CAMERA) && hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)
 
     private fun hasPermission(permission: String): Boolean =
         ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
 
+    private fun startProductionServices() {
+        registerSensors()
+        startLocationUpdates()
+        ensureArSession()
+    }
+
     private fun ensureArSession() {
-        if (!hasPermission(Manifest.permission.CAMERA) || arRunning) return
+        if (!hasRequiredPermissions() || arRunning) return
         try {
             when (ArCoreApk.getInstance().requestInstall(this, !installRequested)) {
                 ArCoreApk.InstallStatus.INSTALL_REQUESTED -> {
@@ -187,11 +210,18 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             }
 
             val session = arSession ?: Session(this).also { s ->
+                geospatialSupported = s.isGeospatialModeSupported(Config.GeospatialMode.ENABLED)
+                if (!geospatialSupported) {
+                    toast("This device does not support ARCore Geospatial")
+                }
+
                 val config = Config(s).apply {
                     focusMode = Config.FocusMode.AUTO
                     updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
-                    planeFindingMode = Config.PlaneFindingMode.DISABLED
+                    // Horizontal planes can improve dynamic alignment of terrain anchors on ground.
+                    planeFindingMode = Config.PlaneFindingMode.HORIZONTAL
                     lightEstimationMode = Config.LightEstimationMode.DISABLED
+                    if (geospatialSupported) geospatialMode = Config.GeospatialMode.ENABLED
                 }
                 s.configure(config)
                 arSession = s
@@ -202,8 +232,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             session.resume()
             arView.onResume()
             arRunning = true
-        } catch (_: Throwable) {
-            toast("ARCore is unavailable on this device")
+            requestActiveTargetResolution(force = true)
+        } catch (t: Throwable) {
+            geospatialSupported = false
+            toast("Unable to start Geospatial AR: ${t.javaClass.simpleName}")
+            renderUi()
         }
     }
 
@@ -220,6 +253,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     }
 
     private fun registerSensors() {
+        sensorManager.unregisterListener(this)
         sensorManager.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)?.let {
             sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
         }
@@ -234,7 +268,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             Sensor.TYPE_GAME_ROTATION_VECTOR -> updateGameYaw(yaw, event.timestamp)
             Sensor.TYPE_ROTATION_VECTOR -> updateAbsoluteHeading(yaw)
         }
-        maybeAutoCreateTarget()
         recomputeGlobalGeometry()
         renderUi()
     }
@@ -309,7 +342,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         rawLocation = location
         gpsAccuracy = if (location.hasAccuracy()) location.accuracy else Float.MAX_VALUE
 
-        if (location.hasAccuracy() && location.accuracy > 40f && filteredLocation != null) {
+        if (location.hasAccuracy() && location.accuracy > 50f && filteredLocation != null) {
             renderUi()
             return
         }
@@ -338,42 +371,74 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             }
         }
 
-        maybeAutoCreateTarget()
         recomputeGlobalGeometry()
         renderUi()
     }
 
-    private fun maybeAutoCreateTarget() {
-        if (!autoTargetPending || treeLat != null) return
-        val loc = filteredLocation ?: return
-        val heading = filteredHeading ?: trueHeading ?: return
-        if (gpsAccuracy > 10f || !arFrame.tracking) return
-        createTarget(loc, heading, selectedDistance, elevationOffset)
-        autoTargetPending = false
-    }
-
-    private fun createTarget(location: Location, heading: Double, distance: Int, elevation: Int) {
+    /**
+     * Creates a generated test target, but resolves it through the exact same Terrain Anchor path
+     * as a production tree. The only difference is where its fixed lat/lng came from.
+     */
+    private fun createGeneratedTestTarget(location: Location, heading: Double, distance: Int, elevation: Int) {
         val dest = destinationPoint(location.latitude, location.longitude, heading, distance.toDouble())
-        treeLat = dest.first
-        treeLng = dest.second
-        gpsBearing = heading
-        filteredBearing = heading
-        previousTargetState = ArCoreCameraView.TargetState.NONE
-        arView.replaceTargetAhead(distance.toFloat(), elevation.toFloat())
-        recomputeGlobalGeometry()
+        val target = TreeTargetStore.Target(
+            treeId = "TEST-${System.currentTimeMillis()}",
+            latitude = dest.first,
+            longitude = dest.second,
+            altitudeAboveTerrainM = elevation.toDouble(),
+            source = TreeTargetStore.Target.Source.GENERATED_TEST
+        )
+        setProductionTarget(target)
     }
 
-    /** GPS geometry remains diagnostic/global-reference data after the AR target has been requested. */
+    private fun setProductionTarget(target: TreeTargetStore.Target) {
+        activeTarget = target
+        targetStore.save(target)
+        targetResolutionRequested = false
+        gpsBearing = null
+        filteredBearing = null
+        previousTargetState = ArCoreCameraView.TargetState.NONE
+        recomputeGlobalGeometry()
+        requestActiveTargetResolution(force = true)
+        renderUi()
+    }
+
+    private fun requestActiveTargetResolution(force: Boolean = false) {
+        val target = activeTarget ?: return
+        if (!arRunning || !geospatialSupported) return
+        if (targetResolutionRequested && !force) return
+        targetResolutionRequested = true
+        arView.replaceTerrainTarget(
+            target.latitude,
+            target.longitude,
+            target.altitudeAboveTerrainM
+        )
+    }
+
     private fun recomputeGlobalGeometry() {
         val loc = filteredLocation ?: return
-        val lat = treeLat ?: return
-        val lng = treeLng ?: return
-        val bearing = BearingMath.bearingDegrees(loc.latitude, loc.longitude, lat, lng)
+        val target = activeTarget ?: return
+        val bearing = BearingMath.bearingDegrees(loc.latitude, loc.longitude, target.latitude, target.longitude)
         gpsBearing = bearing
         filteredBearing = filteredBearing?.let { previous ->
             val error = BearingMath.angleDifference(bearing, previous)
             BearingMath.normalizeDegrees(previous + error * if (gpsAccuracy <= 8f) 0.20 else 0.08)
         } ?: bearing
+    }
+
+    private fun handleTargetStateTransition(newState: ArCoreCameraView.TargetState) {
+        if (newState == previousTargetState) return
+        when (newState) {
+            ArCoreCameraView.TargetState.LOCKED -> toast("Tree is geospatially locked")
+            ArCoreCameraView.TargetState.ERROR -> toast("Target resolve failed: ${arFrame.targetError ?: "unknown error"}")
+            ArCoreCameraView.TargetState.TRACKING_LOST -> {
+                if (previousTargetState == ArCoreCameraView.TargetState.LOCKED) {
+                    toast("Localization degraded — marker hidden until tracking recovers")
+                }
+            }
+            else -> Unit
+        }
+        previousTargetState = newState
     }
 
     private fun handleUiAction(action: TreeNavigatorUiView.Action) {
@@ -396,68 +461,50 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             TreeNavigatorUiView.Action.EXIT -> finish()
             TreeNavigatorUiView.Action.CYCLE_DISTANCE -> {
                 selectedDistance = if (selectedDistance >= 100) 10 else selectedDistance + 5
-                saveSettings()
-                renderUi()
+                saveSettings(); renderUi()
             }
             TreeNavigatorUiView.Action.CYCLE_ELEVATION -> {
                 elevationOffset = when (elevationOffset) {
-                    0 -> 1
-                    1 -> 2
-                    2 -> -2
-                    -2 -> -1
-                    else -> 0
+                    0 -> 1; 1 -> 2; 2 -> -2; -2 -> -1; else -> 0
                 }
-                saveSettings()
-                renderUi()
+                saveSettings(); renderUi()
             }
             TreeNavigatorUiView.Action.CREATE_TARGET -> {
                 val loc = filteredLocation ?: rawLocation
                 val heading = filteredHeading ?: trueHeading
-                if (loc == null) {
-                    toast("Waiting for an accurate GPS position")
-                } else if (heading == null) {
-                    toast("Waiting for heading sensor")
-                } else if (!arFrame.tracking) {
-                    toast("Move the phone slowly until AR tracking is ready")
-                } else {
-                    createTarget(loc, heading, selectedDistance, elevationOffset)
-                    autoTargetPending = false
-                    uiView.screen = TreeNavigatorUiView.Screen.HOME
-                    toast("Creating target…")
+                when {
+                    !geospatialSupported -> toast("Geospatial mode is not supported on this device")
+                    !hasPermission(Manifest.permission.ACCESS_FINE_LOCATION) -> toast("Precise location is required")
+                    loc == null -> toast("Waiting for precise location")
+                    heading == null -> toast("Waiting for heading sensor")
+                    !arRunning -> toast("AR session is not ready")
+                    else -> {
+                        createGeneratedTestTarget(loc, heading, selectedDistance, elevationOffset)
+                        uiView.screen = TreeNavigatorUiView.Screen.HOME
+                        toast("Resolving terrain target…")
+                    }
                 }
             }
             TreeNavigatorUiView.Action.TOGGLE_DISTANCE -> {
-                showDistance = !showDistance
-                saveSettings()
-                renderUi()
+                showDistance = !showDistance; saveSettings(); renderUi()
             }
             TreeNavigatorUiView.Action.TOGGLE_GUIDANCE -> {
-                showGuidance = !showGuidance
-                saveSettings()
-                renderUi()
+                showGuidance = !showGuidance; saveSettings(); renderUi()
             }
             TreeNavigatorUiView.Action.TOGGLE_DECLINATION -> {
-                declinationEnabled = !declinationEnabled
-                saveSettings()
-                renderUi()
+                declinationEnabled = !declinationEnabled; saveSettings(); renderUi()
             }
             TreeNavigatorUiView.Action.CYCLE_HEADING_SMOOTHING -> {
                 headingSmoothing = when (headingSmoothing) {
-                    "Balanced" -> "Stable"
-                    "Stable" -> "Responsive"
-                    else -> "Balanced"
+                    "Balanced" -> "Stable"; "Stable" -> "Responsive"; else -> "Balanced"
                 }
-                saveSettings()
-                renderUi()
+                saveSettings(); renderUi()
             }
             TreeNavigatorUiView.Action.CYCLE_GPS_SMOOTHING -> {
                 gpsSmoothing = when (gpsSmoothing) {
-                    "High" -> "Medium"
-                    "Medium" -> "Low"
-                    else -> "High"
+                    "High" -> "Medium"; "Medium" -> "Low"; else -> "High"
                 }
-                saveSettings()
-                renderUi()
+                saveSettings(); renderUi()
             }
         }
     }
@@ -465,32 +512,30 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private fun open(screen: TreeNavigatorUiView.Screen) {
         previousScreen = if (uiView.screen == TreeNavigatorUiView.Screen.MENU) {
             TreeNavigatorUiView.Screen.HOME
-        } else {
-            uiView.screen
-        }
+        } else uiView.screen
         uiView.screen = screen
         renderUi()
     }
 
     private fun renderUi() {
         val heading = filteredHeading ?: trueHeading
+        val target = activeTarget
         val fallbackDelta = if (heading != null && filteredBearing != null) {
             BearingMath.angleDifference(filteredBearing!!, heading)
         } else null
 
-        val worldLocked = arFrame.targetState == ArCoreCameraView.TargetState.LOCKED && arFrame.tracking && arFrame.anchorReady
+        val worldLocked =
+            arFrame.targetState == ArCoreCameraView.TargetState.LOCKED &&
+                arFrame.anchorReady &&
+                arFrame.geospatialState == ArCoreCameraView.GeospatialState.LOCALIZED
+
         val direction = if (worldLocked) arFrame.horizontalAngleDeg else fallbackDelta
         val arDistance = if (worldLocked) arFrame.distanceMeters?.toDouble() else null
-
-        val globalDistance = filteredLocation?.let { loc ->
-            val lat = treeLat
-            val lng = treeLng
-            if (lat != null && lng != null) {
-                val out = FloatArray(1)
-                Location.distanceBetween(loc.latitude, loc.longitude, lat, lng, out)
-                out[0].toDouble()
-            } else null
-        }
+        val globalDistance = if (target != null) filteredLocation?.let { loc ->
+            val out = FloatArray(1)
+            Location.distanceBetween(loc.latitude, loc.longitude, target.latitude, target.longitude, out)
+            out[0].toDouble()
+        } else null
 
         val gpsQuality = when {
             gpsAccuracy <= 8f -> "GOOD"
@@ -498,24 +543,27 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             gpsAccuracy < Float.MAX_VALUE -> "POOR"
             else -> "WAITING"
         }
-
         val headingQuality = when {
             sensorAccuracy == SensorManager.SENSOR_STATUS_UNRELIABLE -> "CALIBRATE"
             heading != null -> "GOOD"
             else -> "WAITING"
         }
 
-        val arStatus = when (arFrame.targetState) {
-            ArCoreCameraView.TargetState.NONE -> if (arFrame.tracking) "READY TO CREATE" else "ACQUIRING"
-            ArCoreCameraView.TargetState.REQUESTED -> "CREATING TARGET"
-            ArCoreCameraView.TargetState.WAITING_FOR_STABLE_TRACKING -> "WAITING FOR STABLE TRACKING"
-            ArCoreCameraView.TargetState.LOCKED -> when {
-                !arFrame.tracking -> "TRACKING LOST"
-                !arFrame.inFront -> "TARGET BEHIND"
-                arFrame.screenX == null || arFrame.screenY == null -> "TARGET OFF SCREEN"
-                else -> "WORLD LOCKED"
-            }
-            ArCoreCameraView.TargetState.TRACKING_LOST -> "TRACKING LOST"
+        val arStatus = when {
+            !hasGeospatialConsent() -> "CONSENT REQUIRED"
+            !hasPermission(Manifest.permission.ACCESS_FINE_LOCATION) -> "PRECISE LOCATION REQUIRED"
+            !geospatialSupported -> "GEOSPATIAL UNSUPPORTED"
+            arFrame.geospatialState == ArCoreCameraView.GeospatialState.ERROR -> "EARTH ERROR: ${arFrame.earthState}"
+            arFrame.targetState == ArCoreCameraView.TargetState.ERROR -> "TARGET ERROR: ${arFrame.targetError ?: arFrame.terrainResolveState}"
+            arFrame.targetState == ArCoreCameraView.TargetState.RESOLVING_TERRAIN -> "RESOLVING TERRAIN"
+            arFrame.targetState == ArCoreCameraView.TargetState.WAITING_FOR_GEOSPATIAL -> "WAITING FOR GEO LOCALIZATION"
+            arFrame.targetState == ArCoreCameraView.TargetState.TRACKING_LOST -> "LOCALIZATION DEGRADED"
+            worldLocked && !arFrame.inFront -> "TARGET BEHIND"
+            worldLocked && (arFrame.screenX == null || arFrame.screenY == null) -> "TARGET OFF SCREEN"
+            worldLocked -> "GEOSPATIAL LOCKED"
+            arFrame.geospatialState == ArCoreCameraView.GeospatialState.LOCALIZING -> "LOCALIZING"
+            arFrame.geospatialState == ArCoreCameraView.GeospatialState.LOCALIZED -> "READY"
+            else -> "ACQUIRING"
         }
 
         uiView.model = TreeNavigatorUiView.Model(
@@ -530,7 +578,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             targetScreenY = if (worldLocked) arFrame.screenY else null,
             targetInFront = worldLocked && arFrame.inFront,
             targetReady = worldLocked,
-            targetRequested = treeLat != null,
+            targetRequested = target != null,
             arTracking = worldLocked,
             arMovementM = arFrame.movementSinceAnchorMeters?.toDouble(),
             arFailureReason = arFrame.trackingFailureReason,
@@ -550,9 +598,17 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             filteredBearing = filteredBearing,
             phoneLat = filteredLocation?.latitude,
             phoneLng = filteredLocation?.longitude,
-            treeLat = treeLat,
-            treeLng = treeLng,
-            arStatus = arStatus
+            treeLat = target?.latitude,
+            treeLng = target?.longitude,
+            arStatus = arStatus,
+            targetId = target?.treeId ?: "--",
+            targetSource = target?.source?.name ?: "NONE",
+            geospatialState = arFrame.geospatialState.name,
+            earthState = arFrame.earthState,
+            geospatialHorizontalAccuracyM = arFrame.geospatialHorizontalAccuracyM,
+            geospatialYawAccuracyDeg = arFrame.geospatialYawAccuracyDeg,
+            terrainResolveState = arFrame.terrainResolveState,
+            apiKeyPresent = BuildConfig.ARCORE_API_KEY_PRESENT
         )
     }
 
@@ -597,5 +653,30 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         return Math.toDegrees(lat2) to Math.toDegrees(lon2)
     }
 
+    private fun emptyArFrame() = ArCoreCameraView.FrameState(
+        tracking = false,
+        anchorReady = false,
+        targetState = ArCoreCameraView.TargetState.NONE,
+        geospatialState = ArCoreCameraView.GeospatialState.DISABLED,
+        earthState = "DISABLED",
+        geospatialHorizontalAccuracyM = null,
+        geospatialYawAccuracyDeg = null,
+        terrainResolveState = "NONE",
+        targetError = null,
+        screenX = null,
+        screenY = null,
+        inFront = false,
+        distanceMeters = null,
+        horizontalAngleDeg = null,
+        verticalAngleDeg = null,
+        movementSinceAnchorMeters = null,
+        trackingFailureReason = "NONE",
+        cameraTrackingState = TrackingState.PAUSED
+    )
+
     private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+
+    companion object {
+        private const val KEY_GEOSPATIAL_CONSENT = "geospatial_consent"
+    }
 }
