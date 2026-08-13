@@ -73,7 +73,18 @@ class BleTreeScanner(
         target = identity
         filteredRssi = null
         seenCount = 0
-        update(baseState())
+        update(baseState().copy(
+            targetMatched = false,
+            targetAddress = null,
+            targetName = null,
+            rawRssi = null,
+            filteredRssi = null,
+            proximity = Proximity.UNKNOWN,
+            estimatedDistanceM = null,
+            seenCount = 0,
+            lastSeenElapsedMs = null,
+            error = null
+        ))
     }
 
     fun currentState(): State = state
@@ -94,13 +105,15 @@ class BleTreeScanner(
             return
         }
         if (state.scanning) return
+
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .setReportDelay(0L)
             .build()
+
         try {
             a.bluetoothLeScanner?.startScan(null, settings, callback)
-            update(baseState().copy(scanning = true))
+            update(baseState().copy(scanning = true, error = null))
         } catch (t: Throwable) {
             update(baseState().copy(error = "Unable to start BLE scan: ${t.javaClass.simpleName}"))
         }
@@ -138,7 +151,7 @@ class BleTreeScanner(
             rssi >= -70 -> Proximity.NEAR
             else -> Proximity.FAR
         }
-        val distance = estimateDistanceFromRssi(rssi)
+
         update(
             baseState().copy(
                 scanning = true,
@@ -148,7 +161,7 @@ class BleTreeScanner(
                 rawRssi = result.rssi,
                 filteredRssi = rssi,
                 proximity = proximity,
-                estimatedDistanceM = distance,
+                estimatedDistanceM = estimateDistanceFromRssi(rssi),
                 seenCount = seenCount,
                 lastSeenElapsedMs = android.os.SystemClock.elapsedRealtime(),
                 error = null
@@ -160,18 +173,24 @@ class BleTreeScanner(
         val record = result.scanRecord ?: return ""
         val parts = mutableListOf<String>()
         record.serviceUuids?.forEach { parts += it.uuid.toString() }
-        for (i in 0..65535) {
-            val bytes = record.getManufacturerSpecificData(i) ?: continue
+
+        val manufacturer = record.manufacturerSpecificData
+        for (index in 0 until manufacturer.size()) {
+            manufacturer.valueAt(index)?.let { bytes ->
+                parts += bytes.toString(Charsets.UTF_8)
+                parts += bytes.joinToString("") { "%02x".format(it) }
+            }
+        }
+
+        record.serviceData?.forEach { (uuid, bytes) ->
+            parts += uuid.uuid.toString()
             parts += bytes.toString(Charsets.UTF_8)
-            if (parts.size > 8) break
+            parts += bytes.joinToString("") { "%02x".format(it) }
         }
         return parts.joinToString("|")
     }
 
-    /**
-     * Coarse BLE RSSI estimate only. Tx power/environment are unknown, so this is UI guidance,
-     * never the authoritative navigation distance.
-     */
+    /** Coarse RSSI estimate only; never used as authoritative AR distance. */
     private fun estimateDistanceFromRssi(rssi: Double): Double {
         val calibratedTxPowerAt1m = -59.0
         val pathLossExponent = 2.2
@@ -196,13 +215,12 @@ class BleTreeScanner(
         error = state.error
     )
 
-    private fun hasScanPermission(): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+    private fun hasScanPermission(): Boolean =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             ContextCompat.checkSelfPermission(appContext, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
         } else {
             ContextCompat.checkSelfPermission(appContext, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
         }
-    }
 
     private fun update(newState: State) {
         state = newState
