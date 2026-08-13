@@ -16,6 +16,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      # Optional. If this Actions secret is absent, the app is built for keyless authorization.
+      # Never commit the Geospatial API key to source control.
+      ARCORE_API_KEY: ${{ secrets.ARCORE_API_KEY }}
 
     steps:
       - name: Checkout
@@ -53,7 +57,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: tree-navigator-production-apk
+          name: tree-navigator-production-geospatial-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 7
